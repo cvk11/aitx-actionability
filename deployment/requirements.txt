@@ -1,0 +1,9 @@
+anthropic==2.3.0
+httpx==0.28.1
+pydantic==2.14.2
+tenacity==9.1.4
+python-dotenv==1.2.4
+google-genai==2.34.0
+gradio==6.31.0
+fastapi==0.162.0
+uvicorn==0.54.0

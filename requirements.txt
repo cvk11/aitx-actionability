@@ -1,0 +1,16 @@
+# Pinned runtime dependencies (verified installable 2026-11-01, Python 3.13)
+anthropic==2.3.0
+httpx==0.28.1
+pydantic==2.14.2
+tenacity==9.1.4
+python-dotenv==1.2.4
+# optional independent reviewer
+google-genai==2.34.0
+# deployment (Hugging Face Space)
+gradio==6.31.0
+fastapi==0.162.0
+uvicorn==0.54.0
+# development / tests
+pytest==9.2.0
+respx==0.23.1
+gradio_client==2.7.2

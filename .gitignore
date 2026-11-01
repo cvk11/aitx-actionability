@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+data/cache/
+data/genereviews/
+outputs/internal/
+outputs/runs/
+*.log
+.DS_Store
+outputs/space_bundle/
+outputs/compare/
+*.egg-info/

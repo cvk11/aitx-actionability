@@ -1,0 +1,2 @@
+{"id": "TEST-0001", "patient": {"genotype": [{"gene": "GENEX", "transcript": "NM_999999.1", "variant_cdna": "c.100G>A", "variant_protein": "p.Asp34Asn", "zygosity": "heterozygous"}],
+ "clinical_context": "5-year-old girl with drug-resistant focal seizures and developmental delay; de novo variant."}}

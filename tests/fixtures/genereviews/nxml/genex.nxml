@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<book-part-wrapper content-type="chapter" id="genex">
+  <book-part><book-part-meta><title-group><title>GENEX-Related Epilepsy</title></title-group>
+  <pub-history><date date-type="updated"><day>1</day><month>2</month><year>2024</year></date></pub-history></book-part-meta>
+  <body>
+    <sec id="genex.Management"><title>Management</title>
+      <sec id="genex.Treatment_of_Manifestations"><title>Treatment of Manifestations</title>
+        <p>Seizures are treated with standard anti-seizure medications <xref ref-type="bibr" rid="genex.REF.a">[A 2020]</xref>.</p></sec>
+      <sec id="genex.AgentsCircumstances_to_Avoid"><title>Agents/Circumstances to Avoid</title><p>Avoid drug Z, which worsened seizures in affected individuals.</p></sec>
+    </sec>
+  </body>
+  <back><ref-list><ref id="genex.REF.a"><element-citation><pub-id pub-id-type="pmid">11111111</pub-id></element-citation></ref></ref-list></back>
+  </book-part>
+</book-part-wrapper>
