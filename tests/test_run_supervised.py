@@ -4,10 +4,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import run_supervised as sup  # noqa: E402
+from aitx.config import get_settings  # noqa: E402
 
 
 class FakeGit:
@@ -122,3 +125,45 @@ def test_proposal_hitting_forbidden_area_is_rejected(tmp_path):
     report = s.run({"id": "T"}, authorize_paid=True, max_cycles=2)
     assert report["outcome"] == "proposal_rejected"
     assert not git.committed
+
+
+def _res2(submittable, blockers=(), cost=0.0):
+    r = _res(submittable, blockers)
+    r.audit = {"cost": {"total_usd": cost}}
+    return r
+
+
+def test_session_budget_stops_before_the_next_cycle(tmp_path):
+    root, _ = _tmp_repo(tmp_path)
+    git = FakeGit()
+    runs = {"n": 0}
+
+    def run_case(case):
+        runs["n"] += 1
+        return _res2(submittable=False, blockers=CODE_FAIL, cost=0.6), None
+
+    s = sup.Supervisor(get_settings(), root=root, fixer_llm=Fixer(
+        sup.FixProposal(diagnosis="d", summary="s", files=[sup.FixFile(path="src/aitx/llm/gemini_client.py", content="# x")])),
+        run_case=run_case, run_suite=lambda: True, git=git, total_budget=0.5)
+    report = s.run({"id": "T"}, authorize_paid=True, max_cycles=2)
+    assert report["outcome"] == "total_budget_reached"
+    assert runs["n"] == 1 and report["spent_usd"] == pytest.approx(0.6)
+    assert len(git.committed) == 1  # the accepted fix is still recorded
+
+
+def test_per_cycle_budget_shrinks_to_remaining(tmp_path):
+    root, _ = _tmp_repo(tmp_path)
+    git = FakeGit()
+    budgets = []
+
+    class _Sup(sup.Supervisor):
+        def run_case(self, case):
+            budgets.append(self.current_settings.max_cost_usd_per_case)
+            return _res2(submittable=False, blockers=CODE_FAIL, cost=0.2), None
+
+    s = _Sup(get_settings(max_cost_usd_per_case=12.0), root=root, fixer_llm=Fixer(
+        sup.FixProposal(diagnosis="d", summary="s", files=[sup.FixFile(path="src/aitx/llm/gemini_client.py", content="# x")])),
+        run_suite=lambda: True, git=git, total_budget=1.0)
+    report = s.run({"id": "T"}, authorize_paid=True, max_cycles=3)
+    assert budgets == [1.0, 0.8, 0.6]  # each cycle only gets what the session cap leaves
+    assert report["outcome"] == "max_fix_cycles_exhausted"

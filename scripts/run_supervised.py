@@ -147,7 +147,8 @@ SYSTEM = (
 class Supervisor:
     """Orchestrates: run -> diagnose -> propose -> rail-check -> apply -> test -> commit -> retry."""
 
-    def __init__(self, settings: Settings, root: Path = ROOT, fixer_llm=None, run_case=None, run_suite=None, git=None):
+    def __init__(self, settings: Settings, root: Path = ROOT, fixer_llm=None, run_case=None, run_suite=None, git=None,
+                 total_budget: float | None = None):
         self.settings = settings
         self.root = root
         self.fixer = fixer_llm
@@ -155,6 +156,9 @@ class Supervisor:
         self._run_suite = run_suite
         self._git = git or _Git(root)
         self.cycles: list[dict[str, Any]] = []
+        self.total_budget = total_budget  # hard session cap: pipeline runs + fixer calls together
+        self.spent = 0.0
+        self.current_settings = settings
 
     # ---------------------------------------------------------------- injectable operations
     def run_case(self, case: dict) -> tuple[Any, str | None]:
@@ -163,7 +167,7 @@ class Supervisor:
         from aitx.factory import build_pipeline
 
         try:
-            res = build_pipeline("B_full", self.settings).run(case)
+            res = build_pipeline("B_full", self.current_settings).run(case)
             return res, None
         except Exception as e:  # pipeline catches its own errors; this is a last resort
             return None, f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
@@ -183,25 +187,55 @@ class Supervisor:
         from aitx.llm.base import CostTracker
         from aitx.llm.gemini_client import GeminiLLM
 
+        if self.total_budget is not None:
+            fixer_budget = max(0.0, min(self.settings.max_fix_cost_usd, self.total_budget - self.spent))
+        else:
+            fixer_budget = self.settings.max_fix_cost_usd if self.settings is not None else 1.0
         fixer = self.fixer or GeminiLLM(get_settings(max_tokens=8192, max_attempts=2, effort="low"),
-                                        CostTracker(self.settings.max_fix_cost_usd), )
+                                        CostTracker(fixer_budget))
         ctx = fixer_context("", failure)
         user = json.dumps({"task": "Diagnose the failure and propose the smallest safe fix under the hard rules.",
                            "context": ctx}, indent=1)
-        return fixer.structured(stage="supervisor:fix", system=SYSTEM, user=user, output_model=FixProposal, effort="low")
+        prop = fixer.structured(stage="supervisor:fix", system=SYSTEM, user=user, output_model=FixProposal, effort="low")
+        if self.fixer is None:  # real fixer: account its cost against the session cap
+            self.spent += fixer.cost.total_usd
+        return prop
 
     def run(self, case: dict, authorize_paid: bool, max_cycles: int = 2) -> dict[str, Any]:
         report: dict[str, Any] = {"case_id": case.get("id"), "cycles": self.cycles}
         for cycle in range(max_cycles):
             entry: dict[str, Any] = {"cycle": cycle}
+            if self.total_budget is not None:
+                remaining = self.total_budget - self.spent
+                if remaining <= 0.05:
+                    entry["outcome"] = "total_budget_reached"
+                    self.cycles.append(entry)
+                    report["outcome"] = "total_budget_reached"
+                    report["spent_usd"] = round(self.spent, 4)
+                    return report
+                # shrink this cycle's per-case budget to what the session cap leaves (pipeline guard is per process)
+                from dataclasses import replace
+
+                self.current_settings = replace(self.settings,
+                                                max_cost_usd_per_case=min(self.settings.max_cost_usd_per_case, remaining))
+                entry["cycle_budget_usd"] = round(self.current_settings.max_cost_usd_per_case, 4)
             res, err = self.run_case(case)
             entry["run_error"] = err
+            if res is not None:
+                try:
+                    cost = float(res.audit.get("cost", {}).get("total_usd", 0.0))
+                except Exception:
+                    cost = 0.0
+                self.spent += cost
+                entry["run_cost_usd"] = round(cost, 4)
+            entry["spent_usd"] = round(self.spent, 4)
             blockers = getattr(res, "blockers", None) if res is not None else None
             entry["blockers"] = blockers
             if res is not None and res.submittable:
                 entry["outcome"] = "submittable"
                 self.cycles.append(entry)
                 report["outcome"] = "submittable"
+                report["spent_usd"] = round(self.spent, 4)
                 report["result"] = res
                 return report
             if not authorize_paid:
@@ -270,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--authorize-paid", action="store_true", help="allow the paid fixer calls (pipeline itself is paid regardless)")
     ap.add_argument("--max-fix-cycles", type=int, default=2)
     ap.add_argument("--max-fix-cost-usd", type=float, default=1.0)
+    ap.add_argument("--max-total-cost-usd", type=float, default=None,
+                    help="hard session cap across pipeline runs AND fixer calls; the run stops before exceeding it")
     args = ap.parse_args(argv)
     s = get_settings(max_fix_cost_usd=args.max_fix_cost_usd)
     setup_logging(s.log_level)
@@ -278,8 +314,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unknown case id {args.case_id}", file=sys.stderr)
         return 2
     print(f"Supervised B_full run for {args.case_id} — paid pipeline; fixer paid only with --authorize-paid "
-          f"(fixer cap ${args.max_fix_cost_usd:.2f}/cycle, {args.max_fix_cycles} cycles).")
-    sup = Supervisor(s)
+          f"(fixer cap ${args.max_fix_cost_usd:.2f}/cycle, {args.max_fix_cycles} cycles, "
+          f"session cap ${args.max_total_cost_usd if args.max_total_cost_usd is not None else 'unlimited'}).")
+    sup = Supervisor(s, total_budget=args.max_total_cost_usd)
     report = sup.run(cases[0], authorize_paid=args.authorize_paid, max_cycles=args.max_fix_cycles)
     out = ROOT / "outputs" / "internal" / f"{args.case_id}.supervised.json"
     out.parent.mkdir(parents=True, exist_ok=True)

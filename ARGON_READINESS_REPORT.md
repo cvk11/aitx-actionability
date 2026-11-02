@@ -125,7 +125,7 @@ Regresyon testleri: anormal şekil kabulü + tutarlı faturalama; kullanılamaz 
 - kabul edilen düzeltme `supervised fix: ...` commit'i olur; reddedilen öneriler `outputs/internal/<id>.supervised.json`'da kayıtlıdır;
 - bütçe/ret (BudgetExceeded/ModelRefusal) ve gönderilebilir sonuçlar asla düzelticiyi tetiklemez; en fazla 2 düzeltme döngüsü.
 
-Her döngü konsola ve `supervised.json`'a sonuç yazar (`submittable` / `reverted_after_test_failure` / `proposal_rejected` / `not_fixable` / `fixer_error` / `max_fix_cycles_exhausted`) — takılmaz, her zaman bir sonuçla biter. 8 çevrimdışı ray testi eklendi.
+Her döngü konsola ve `supervised.json`'a sonuç yazar (`submittable` / `reverted_after_test_failure` / `proposal_rejected` / `not_fixable` / `fixer_error` / `max_fix_cycles_exhausted`) — takılmaz, her zaman bir sonuçla biter. **Oturum tavanı:** `--max-total-cost-usd N` ile koşular + düzeltici çağrıları birlikte sert biçimde sınırlanır; her döngüye yalnızca kalan bütçe kadar vaka payı verilir, aşım öncesi `total_budget_reached` ile durur ve harcanan toplam `spent_usd` olarak rapora yazılır. 10 çevrimdışı ray testi eklendi.
 
 ## 10. Nihai karar
 
