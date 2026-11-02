@@ -1,5 +1,7 @@
 # Scientific remediation report — second independent audit of commit `36d8d3e`
 
+Commits: `9e1084d` (S1–S10, ITPR1 regressions), `7826a29` (residual R1–R9). Final verification on `7826a29`: `pytest` 116 passed (offline), `pytest -m live` 6 passed (free public APIs only). No paid model call, no deployment, no submission.
+
 Scope: scientific reliability (patient-specific verification, candidate recall, evidence access, synthesis consistency, deterministic safeguards). No paid model call, no deployment, no submission; Claude-only architecture unchanged; no new agent (the existing follow-up researcher handles candidate handoffs).
 
 **Reproduction:** 12 failure modes were reproduced behaviourally on `36d8d3e` with its own API (script run against a separate worktree of the audited commit): all 12 reproduced. The new test files (`tests/test_second_audit.py`, `tests/test_itpr1_regression.py`) do not even import on the audited code (missing interfaces). **After the fixes (including the residual pass below):** `pytest` 116 passed (offline), `pytest -m live` 6 passed (free public APIs), 2 third-party warnings.
