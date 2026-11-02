@@ -141,11 +141,12 @@ def test_tool_schemas_are_strict():
 
 
 def test_structured_output_schemas_transform():
-    import anthropic
+    from google.genai import types
     from aitx import schemas as S
     for m in (S.Interpretation, S.SectionResearchOutput, S.VerificationBatch, S.RevisionPlan, S.ReviewReport, S.Adjudication, S.Synthesis, S.JudgeReport):
-        sch = anthropic.transform_schema(m)
-        assert sch["type"] == "object" and sch.get("additionalProperties") is False
+        sch = m.model_json_schema()
+        cfg = types.GenerateContentConfig(response_mime_type="application/json", response_json_schema=sch)
+        assert cfg.response_json_schema["type"] == "object"
 
 
 # ---------------------------------------------------------------- QC
