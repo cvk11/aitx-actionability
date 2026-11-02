@@ -100,8 +100,9 @@ class ToolBox:
             result, is_error = {"error": f"bad arguments: {e}"}, True
         except Exception as e:  # network errors etc. are reported to the model, not hidden
             log.warning("tool %s failed (%s)", name, type(e).__name__)
-            self.ledger.log_query(name, args, [], error=str(e)[:300])
-            result, is_error = {"error": f"{type(e).__name__}: {str(e)[:300]}"}, True
+            if not (self.ledger.queries and self.ledger.queries[-1].tool == name and self.ledger.queries[-1].error):
+                self.ledger.log_query(name, args, [], error=str(e)[:300])
+            result, is_error = {"error": f"{type(e).__name__}: {str(e)[:300]} (retrieval FAILED: no conclusion about absence)"}, True
         if is_error and not (self.ledger.queries and self.ledger.queries[-1].tool == name and self.ledger.queries[-1].error):
             self.ledger.log_query(name, args, [], error=str(result.get("error", ""))[:300] if isinstance(result, dict) else "error")
         text = json.dumps(result, ensure_ascii=False, default=str)

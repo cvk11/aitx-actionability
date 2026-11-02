@@ -80,11 +80,19 @@ def coverage_gaps(dossier: dict[str, Any], items: list[ActionItem], per_family: 
     for gene, fams in (dossier.get("therapeutic_coverage") or {}).items():
         for fam, f in fams.items():
             unused = [k for k in f.get("keys", []) if k not in cited]
-            rows.append({"gene": gene, "family": fam, "total": f.get("total"), "reviewed": len(f.get("keys", [])),
+            status = f.get("status") or ("failed" if f.get("error") else ("truncated" if f.get("truncated") else "complete"))
+            rows.append({"gene": gene, "family": fam, "status": status, "total": f.get("total"), "reviewed": len(f.get("keys", [])),
                          "cited": len(f.get("keys", [])) - len(unused), "unused": unused, "truncated": f.get("truncated"), "error": f.get("error", "")})
+            if status in ("failed", "partial"):
+                # a failed mandatory query is a coverage gap: re-run it instead of treating missing hits as negative evidence
+                requests.append(f"[coverage:{gene}:{fam}] The mandatory query '{f.get('query')}' FAILED in the deterministic bootstrap "
+                                f"({f.get('error', '')[:120]}; {len(f.get('keys', []))} hits retrieved before the failure). Re-run it with "
+                                "pubmed_search (all pages), assess the hits for this patient, and state explicitly if it fails again. "
+                                "Do not treat missing hits as evidence of absence.")
             if unused:
                 lst = "; ".join(f"{k} ({(f.get('titles') or {}).get(k, '')[:90]})" for k in unused[:per_family])
-                requests.append(f"[coverage:{gene}:{fam}] Articles from the mandatory query '{f.get('query')}' that no candidate used: {lst}. "
+                more = f" (+{len(unused) - per_family} further unused hits from this query; review them with pubmed_search)" if len(unused) > per_family else ""
+                requests.append(f"[coverage:{gene}:{fam}] Articles from the mandatory query '{f.get('query')}' that no candidate used: {lst}{more}. "
                                 "Assess each for this patient (intervention, direction of effect vs the variant mechanism, species, variant); "
                                 "propose a candidate only if verified evidence supports it, otherwise list it in searched_but_not_found with the reason.")
     return requests, rows

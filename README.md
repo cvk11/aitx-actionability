@@ -8,8 +8,8 @@ Evidence-grounded agentic system that turns a confirmed rare-disease genotype + 
 
 | Category | Meaning | Result |
 |---|---|---|
-| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, audit-regression tests (first audit B1–B9, second audit S1–S10 + residual R1–R9, ITPR1 regression examples), Claude-only policy | 116 passed |
-| Live retrieval tests (`pytest -m live`) | Free public APIs (PubMed, CT.gov, ClinVar, FDA labels, Europe PMC, VV/VEP) on the public CFTR example + ITPR1 evidence-retrieval and therapeutic-coverage regressions | 6 passed |
+| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, audit-regression tests (first audit B1–B9, second audit S1–S10 + residual R1–R9, ITPR1 regression examples, retrieval-failure remediation), Claude-only policy | 145 passed |
+| Live retrieval tests (`pytest -m live`) | Free public APIs (PubMed, CT.gov, ClinVar, FDA labels, Europe PMC, VV/VEP) on the public CFTR example + ITPR1 evidence-retrieval, therapeutic-coverage and coverage-completeness regressions | 7 passed |
 | Deterministic scientific checks (`scripts/scientific_checks.py`) | HGVS/transcript/exon/NMD/ClinVar/ClinGen/GeneReviews/trials on the 4 official cases + CFTR control | see `docs/SCIENTIFIC_CHECKS.md` |
 | Genuine LLM clinical inference | Claude research, interpretation, verification | **not run** (requires authorization + `ANTHROPIC_API_KEY`) |
 
@@ -28,6 +28,7 @@ Passing software tests does not establish scientific or clinical validity.
 - `AGENTS.md`, `CODEX_REVIEW_GUIDE.md` — instructions for independent code review
 - `REMEDIATION_REPORT.md` — fixes for the first independent audit (commit `9be0d2c`, B1–B9)
 - `SCIENTIFIC_REMEDIATION_REPORT.md` — fixes for the second independent audit (commit `36d8d3e`, S1–S10 + ITPR1 regression examples)
+- `RETRIEVAL_REMEDIATION_REPORT.md` — PubMed/E-utilities retrieval-failure fix (HTTP 200 + ERROR read as zero hits; found in the free AITX-40002 preflight)
 
 ## Installation
 Python ≥ 3.11 (developed on 3.13).
@@ -93,7 +94,7 @@ src/aitx/llm/        anthropic_client (Claude), mock, base (cost/budget); gemini
 src/aitx/agents/     interpreter (A), researcher (B/C), verifier (D), reviewer (E), synthesizer (F), context
 prompts/             version-controlled templates (SHA-256 recorded per run)
 data/official*/      verbatim official template and cases + SHA-256 provenance
-scripts/             run_one, run_all, validate_submission, bootstrap_evidence, scientific_checks, estimate_cost,
+scripts/             run_one, run_all, validate_submission, bootstrap_evidence, compare_dossiers, scientific_checks, estimate_cost,
                      robustness, compare_configs, build_genereviews_index, prepare_space
 deployment/          Hugging Face Space app (/actionability_report), requirements, Space card
 tests/               offline unit/integration/endpoint tests + live smoke tests

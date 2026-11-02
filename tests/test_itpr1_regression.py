@@ -152,3 +152,31 @@ def test_live_itpr1_mandatory_therapeutic_coverage_finds_both_regression_publica
     assert all(not f["error"] for f in cov.values())
     assert "PMID:36712939" in cov["activating_modulators"]["keys"]
     assert "PMID:38844245" in cov["human_treatment_reports"]["keys"]
+
+
+@pytest.mark.live
+def test_live_itpr1_coverage_is_complete_or_explicitly_unresolved():
+    """Retrieval-failure remediation: each mandatory family is either complete (all hits up to the cap reviewed across
+    pages) or explicitly marked failed/partial/truncated; the human-treatment family yields both regression
+    publications or is recorded as unresolved. Unrelated notation matches never become variant literature."""
+    from aitx.config import get_settings
+    from aitx.http import HttpClient
+    from aitx.retrieval import europepmc, ncbi
+
+    http = HttpClient(get_settings(deployment_mode=True))
+    L = EvidenceLedger()
+    cov = ncbi.therapeutic_coverage_search(http, L, VAR["gene"])
+    for fam, f in cov.items():
+        assert f["status"] in ("complete", "truncated", "empty", "failed", "partial")
+        if f["status"] == "complete":
+            assert f["reviewed"] == f["total"]
+        if f["status"] in ("failed", "partial"):
+            assert f["error"] and ncbi.coverage_failures({VAR["gene"]: cov})
+    hum = cov["human_treatment_reports"]
+    if hum["status"] in ("complete", "truncated"):
+        assert {"PMID:38844245", "PMID:37964426"} <= set(hum["keys"])
+    else:
+        assert hum["error"]  # unresolved, never an empty result
+    vl = europepmc.variant_literature_search(http, L, VAR["gene"], sorted(NOTS))
+    for h in vl["europepmc"]:
+        assert h["variant_context"]["status"] == "confirmed"

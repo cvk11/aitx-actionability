@@ -153,18 +153,31 @@ def precedent_scope(ledger: EvidenceLedger, item: ActionItem | None = None) -> s
         if not qs:
             return "Human use of this candidate was not specifically searched in this run, so human treatment precedent was not assessed."
     ok = [q for q in qs if not q.error]
+    cov_fail = human_report_coverage_gap(ledger)
     if not qs:
-        return "Human treatment precedent was not specifically searched in this run."
+        return "Human treatment precedent was not specifically searched in this run." + cov_fail
     if not ok:
-        return "Human treatment precedent could not be assessed because literature retrieval failed in this run."
+        return "Human treatment precedent could not be assessed because literature retrieval failed in this run." + cov_fail
     srcs = ", ".join(sorted({SOURCE_NAMES.get(q.tool, q.tool) for q in ok}))
     date = max(q.timestamp[:10] for q in ok)
     trunc = [q for q in ok if q.total_available is not None and q.total_available > q.n_results]
     cover = (f"; {len(trunc)} of {len(ok)} queries returned more hits than were reviewed (only the first "
              f"{min(q.n_results for q in trunc)}-{max(q.n_results for q in trunc)} ranked results per query)" if trunc else "")
-    failed = " Some literature queries failed." if len(ok) < len(qs) else ""
+    failed = f" {len(qs) - len(ok)} of {len(qs)} literature queries failed, so this search is incomplete." if len(ok) < len(qs) else ""
     return (f"No human treatment precedent in this gene/disease/variant context was identified in the literature searched in this run "
-            f"({srcs}, accessed {date}{cover}); this does not establish that none exists.{failed}")
+            f"({srcs}, accessed {date}{cover}); this does not establish that none exists.{failed}{cov_fail}")
+
+
+def human_report_coverage_gap(ledger: EvidenceLedger) -> str:
+    """Sentence stating that the mandatory gene-level search for human treatment reports failed or was incomplete
+    (and was not successfully repeated later in the run); '' otherwise."""
+    qs = [q for q in ledger.searches_for("pubmed_search") if q.args.get("coverage_family") == "human_treatment_reports"]
+    if not qs:
+        return ""
+    if any(not q.error for q in qs):  # a complete run of the query exists
+        return ""
+    return (" The mandatory gene-level literature search for human treatment reports failed in this run, so published human "
+            "treatment reports may have been missed.")
 
 
 def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dict[Section, list[str]]) -> str:
@@ -179,7 +192,9 @@ def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dic
     }[section]
     qs = ledger.searches_for(*tools)
     ok_q = [q for q in qs if not q.error]
-    failed = sorted({SOURCE_NAMES.get(q.tool, q.tool) for q in qs if q.error} - {SOURCE_NAMES.get(q.tool, q.tool) for q in ok_q})
+    # every source with ANY failed query is named (a failed query is not offset by other successful queries of that source)
+    failed = sorted({SOURCE_NAMES.get(q.tool, q.tool) for q in qs if q.error})
+    fully_failed = sorted(set(failed) - {SOURCE_NAMES.get(q.tool, q.tool) for q in ok_q})
     srcs = sorted({SOURCE_NAMES.get(q.tool, q.tool) for q in ok_q})
     date = max((q.timestamp[:10] for q in qs), default="")
     base = {
@@ -194,7 +209,15 @@ def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dic
     trunc = any(q.total_available is not None and q.total_available > q.n_results for q in ok_q)
     searched = (f" Searched: {', '.join(srcs)} (accessed {date})" + ("; at least one search reviewed only the first page of a larger result set" if trunc else "")
                 + "; absence from these sources does not establish that none exists." if srcs else "")
-    fail = f" Retrieval from {', '.join(failed)} failed during this run, so no conclusion can be drawn from that source." if failed else ""
+    fail = ""
+    if fully_failed:
+        fail = f" Retrieval from {', '.join(fully_failed)} failed during this run, so no conclusion can be drawn from that source."
+    partly = sorted(set(failed) - set(fully_failed))
+    if partly:
+        n = {src: sum(1 for q in qs if q.error and SOURCE_NAMES.get(q.tool, q.tool) == src) for src in partly}
+        fail += " " + "; ".join(f"{k} of the {src} queries failed" for src, k in n.items()) + ", so these searches are incomplete."
+    if section in (Section.OFF_LABEL, Section.REPURPOSING, Section.BESPOKE):
+        fail += human_report_coverage_gap(ledger)
     if not srcs and not failed:
         searched = " No dedicated search was recorded for this section in this run."
     # free-text negative notes from the researchers are unverified model text: kept in the audit, never rendered

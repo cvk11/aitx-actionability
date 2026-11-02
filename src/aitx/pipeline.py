@@ -155,7 +155,10 @@ class Pipeline:
             audit["stages"]["therapeutic_coverage"] = cov_rows
             for r in cov_rows:
                 if r["error"]:
-                    add_issue(audit, "warning", "coverage_query_failed", f"{r['gene']} {r['family']}: query failed ({r['error']}); coverage gap")
+                    add_issue(audit, "warning", "coverage_query_failed", f"{r['gene']} {r['family']}: mandatory coverage query {r.get('status', 'failed')} "
+                                                                          f"({r['error'][:160]}); coverage gap, not evidence of absence")
+                elif r.get("status") == "truncated":
+                    add_issue(audit, "info", "coverage_query_truncated", f"{r['gene']} {r['family']}: {r['reviewed']} of {r['total']} hits reviewed")
             if handoffs or open_q or cov_requests:
                 items, problems = self._handoffs(ctx, items, ledger, toolbox, age, sex, genes, problems, audit, vstate, handoffs, open_q,
                                                  cov_requests)

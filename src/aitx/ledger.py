@@ -127,21 +127,29 @@ class EvidenceLedger:
     def searches_for(self, *tools: str) -> list[QueryLogEntry]:
         return [q for q in self.queries if q.tool in tools]
 
+    def failed_queries(self, *tools: str) -> list[QueryLogEntry]:
+        return [q for q in self.queries if q.error and (not tools or q.tool in tools)]
+
     def retrieval_status(self) -> dict[str, dict[str, int]]:
         """Per source/tool: queries that returned records, returned nothing, or FAILED,
         plus how many were TRUNCATED (the source reported more hits than were reviewed).
 
         'empty' means the query ran and the source had no matching record (not
         proof of biological absence); 'failed' means the source could not be
-        queried (timeout/HTTP error) and nothing can be concluded; 'truncated'
-        means the search was incomplete (first page only)."""
+        queried (timeout/HTTP error, or a backend error/malformed body inside an
+        HTTP 200 response) and nothing can be concluded; 'partial' (a subset of
+        'failed') means some results were retrieved before the failure, so the
+        search is incomplete; 'truncated' means more hits existed than were
+        reviewed."""
         out: dict[str, dict[str, int]] = {}
         for q in self.queries:
-            d = out.setdefault(q.tool, {"with_results": 0, "empty": 0, "failed": 0, "truncated": 0})
+            d = out.setdefault(q.tool, {"with_results": 0, "empty": 0, "failed": 0, "truncated": 0, "partial": 0})
             if not q.error and q.total_available is not None and q.total_available > q.n_results:
                 d["truncated"] += 1
             if q.error:
                 d["failed"] += 1
+                if q.n_results:
+                    d["partial"] += 1
             elif q.n_results:
                 d["with_results"] += 1
             else:

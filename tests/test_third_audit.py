@@ -145,8 +145,12 @@ def test_r8_coverage_gaps_become_follow_up_requests():
         "nucleic_acid_therapies": {"query": "q2", "total": None, "keys": [], "titles": {}, "truncated": False, "error": "HTTPFetchError"}}}}
     it = _item("off-1", Section.OFF_LABEL, [("c", ["PMID:1"], "treatment_effect_human")])
     reqs, rows = coverage_gaps(dossier, [it])
-    assert len(reqs) == 1 and "PMID:7" in reqs[0] and "PMID:1" not in reqs[0].split("used:")[1]
+    unused = [r for r in reqs if "that no candidate used" in r]
+    assert len(unused) == 1 and "PMID:7" in unused[0] and "PMID:1" not in unused[0].split("used:")[1]
     assert {r["family"]: r["error"] for r in rows}["nucleic_acid_therapies"] == "HTTPFetchError"
+    # a failed mandatory family is re-run, never treated as "no hits" (retrieval-failure remediation)
+    rerun = [r for r in reqs if "FAILED" in r]
+    assert len(rerun) == 1 and "'q2'" in rerun[0] and "not treat missing hits as evidence of absence" in rerun[0]
 
 
 def test_r8_pipeline_runs_mandatory_coverage_and_researches_unused_hits(settings, fake_http, test_case):
@@ -199,11 +203,19 @@ def test_r9_clinvar_record_named_on_another_transcript_matches_by_genomic_allele
     other = dict(rec, accession="VCV000000778", title="NM_888888.2(GENEX):c.903G>A (p.Glu301Lys)",
                  variation_set=[{"canonical_spdi": "NC_000003.12:4003:G:A"}])
 
-    class H:
-        def get_json(self, url, params=None, **kw):
-            if url.endswith("esearch.fcgi"):
-                return {"esearchresult": {"idlist": ["777", "778"]}}
-            return {"result": {"uids": ["777", "778"], "777": rec, "778": other}}
+    class H:  # minimal client: E-utilities responses go through the same validators as real ones
+        def request(self, method, url, params=None, validate=None, **kw):
+            import json as _json
+            from urllib.parse import urlencode
+
+            from aitx.http import HTTPResult
+
+            body = ({"esearchresult": {"count": "2", "idlist": ["777", "778"]}} if url.endswith("esearch.fcgi")
+                    else {"result": {"uids": ["777", "778"], "777": rec, "778": other}})
+            r = HTTPResult(url + "?" + urlencode(params or {}), 200, _json.dumps(body), "2026-01-01T00:00:00Z", False)
+            if validate:
+                validate(r)
+            return r
 
     L = EvidenceLedger()
     out = clinvar_lookup(H(), L, "GENEX", "c.100G>A", "NM_999999.1", genomic_vcf="NC_000003.12-4001-G-A")

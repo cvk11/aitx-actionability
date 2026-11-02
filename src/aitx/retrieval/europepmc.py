@@ -6,17 +6,36 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any
 
-from ..http import HttpClient
+from ..http import HttpClient, HTTPResult, ResponseValidationError
 from ..ledger import EvidenceLedger, EvidenceRecord
 
 BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
 
+def validate_search(r: HTTPResult) -> None:
+    """Europe PMC search JSON must carry a numeric hitCount and a resultList; a body without them is a failed search."""
+    try:
+        d = r.json()
+    except ValueError:
+        raise ResponseValidationError("malformed Europe PMC response (not JSON)", r.url) from None
+    if not isinstance(d, dict) or not str(d.get("hitCount", "")).strip().isdigit() or not isinstance(d.get("resultList"), dict):
+        raise ResponseValidationError("malformed Europe PMC response (hitCount/resultList missing)", r.url)
+    if d.get("errCode") or d.get("errMsg"):
+        raise ResponseValidationError(f"Europe PMC error: {str(d.get('errMsg') or d.get('errCode'))[:200]}", r.url)
+
+
 def europepmc_search(http: HttpClient, ledger: EvidenceLedger, query: str, max_results: int = 20, page: int = 1) -> dict[str, Any]:
+    """One page of Europe PMC hits. Failures are logged as FAILED queries and returned as {'error': ...} (never as zero hits)."""
     size = max(1, min(int(max_results), 50))
     page = max(1, int(page or 1))
-    r = http.request("GET", f"{BASE}/search", params={"query": query, "format": "json", "pageSize": size, "page": page, "resultType": "lite"})
+    try:
+        r = http.request("GET", f"{BASE}/search", params={"query": query, "format": "json", "pageSize": size, "page": page, "resultType": "lite"},
+                         validate=validate_search)
+    except Exception as e:
+        ledger.log_query("europepmc_search", {"query": query, "page": page}, [], error=f"{type(e).__name__}: {str(e)[:200]}")
+        return {"error": f"{type(e).__name__}: {str(e)[:200]}"}
     if r.status != 200:
+        ledger.log_query("europepmc_search", {"query": query, "page": page}, [], error=f"HTTP {r.status}")
         return {"error": f"HTTP {r.status}"}
     d = r.json()
     out = []
@@ -157,23 +176,91 @@ def europepmc_fulltext_excerpts(http: HttpClient, ledger: EvidenceLedger, pmcid:
             "supplementary_files": supp[:10], "excerpts": excerpt}
 
 
+def _anchor_re(terms: list[str]) -> re.Pattern[str]:
+    return re.compile("|".join(rf"(?<![A-Za-z0-9]){re.escape(t)}(?![A-Za-z0-9])" for t in terms if t), re.I)
+
+
+def variant_context(rec: EvidenceRecord | None, gene_terms: list[str], notations: list[str]) -> dict[str, Any]:
+    """Does the accessible text of an article mention the patient's variant IN THE CONTEXT OF THIS GENE?
+
+    A Europe PMC full-text hit only shows that the gene symbol and a notation string (e.g. 'D34N') occur somewhere in
+    the article, possibly about another protein. The hit is 'confirmed' only if one passage (paragraph or table row,
+    including its table caption) contains both a gene anchor and a variant notation. Otherwise:
+    'notation_without_gene_context' (the notation occurs only away from the gene), 'notation_not_in_accessible_text'
+    (indexed match not reproducible in the parsed full text, e.g. figures/supplements), or 'full_text_unavailable'."""
+    from ..evidence import mentions_variant
+
+    if rec is None:
+        return {"status": "full_text_unavailable", "passages": []}
+    passages = rec.metadata.get("passages") or []
+    if not passages:
+        st = rec.metadata.get("fulltext_status", "")
+        # title/abstract are still checkable
+        txt = (rec.title or "") + "\n" + (rec.content or "")
+        gene_re = _anchor_re(gene_terms)
+        if txt.strip() and mentions_variant(txt, notations) and gene_re.search(txt):
+            return {"status": "confirmed", "where": "title/abstract", "passages": [txt[:300]], "fulltext_status": st}
+        return {"status": "full_text_unavailable", "passages": [], "fulltext_status": st or "not loaded"}
+    gene_re = _anchor_re(gene_terms)
+    with_notation = [(loc, t) for loc, t in passages if mentions_variant(t, notations)]
+    same = [(loc, t) for loc, t in with_notation if gene_re.search(loc + " " + t)]
+    if same:
+        return {"status": "confirmed", "where": same[0][0][:80], "passages": [f"[{loc[:60]}] {t[:300]}" for loc, t in same[:3]],
+                "notations_found": sorted({n for _, t in same for n in mentions_variant(t, notations)})}
+    if with_notation:
+        return {"status": "notation_without_gene_context", "passages": [f"[{loc[:60]}] {t[:200]}" for loc, t in with_notation[:2]],
+                "notations_found": sorted({n for _, t in with_notation for n in mentions_variant(t, notations)})}
+    return {"status": "notation_not_in_accessible_text", "passages": []}
+
+
 def variant_literature_search(http: HttpClient, ledger: EvidenceLedger, gene: str, notations: list[str], extra_terms: list[str] | None = None,
-                              max_results: int = 25) -> dict[str, Any]:
+                              max_results: int = 25, gene_aliases: list[str] | None = None, check_context: bool = True) -> dict[str, Any]:
     """Variant-centric literature search. PubMed indexes titles/abstracts only, so variant notations that appear only
-    in full text or patient tables are searched in Europe PMC full text as well (open-access articles)."""
+    in full text or patient tables are searched in Europe PMC full text as well (open-access articles).
+
+    Europe PMC hits are then checked for gene context (`variant_context`): only hits whose accessible text mentions the
+    variant together with the gene are returned as variant literature; the others are listed under
+    `europepmc_unconfirmed` with the reason (a notation such as 'D34N' can belong to any protein). A failed source is
+    reported in `failures` and the result status is 'partial'/'failed' (never an empty result)."""
     nots = [n for n in dict.fromkeys(notations) if n]
     if not gene or not nots:
         return {"error": "gene and at least one variant notation required"}
     ors = " OR ".join(f'"{n}"' for n in nots)
     q = f'"{gene}" AND ({ors})' + (" AND (" + " OR ".join(f'"{t}"' for t in extra_terms) + ")" if extra_terms else "")
+    failures: dict[str, str] = {}
     epmc = europepmc_search(http, ledger, q, max_results)
-    from .ncbi import pubmed_search
+    if epmc.get("error"):
+        failures["europepmc"] = epmc["error"]
+    from .ncbi import failure_text, gene_aliases as _aliases, pubmed_search
 
     pm_q = f"{gene}[tiab] AND (" + " OR ".join(f'"{n}"[tiab]' for n in nots) + ")"
-    pm = pubmed_search(http, ledger, pm_q, max_results)
-    ledger.log_query("variant_literature_search", {"gene": gene, "notations": nots},
-                     sorted({r["key"] for r in epmc.get("results", [])} | {r["key"] for r in pm.get("results", [])}))
-    return {"europepmc_fulltext_query": q, "europepmc": epmc.get("results", []), "europepmc_hits": epmc.get("hit_count"),
+    try:
+        pm = pubmed_search(http, ledger, pm_q, max_results)
+    except Exception as e:
+        failures["pubmed"] = failure_text(e)
+        pm = {}
+    terms = gene_aliases if gene_aliases is not None else _aliases(http, gene)
+    confirmed, unconfirmed = [], []
+    for h in epmc.get("results", []):
+        if not check_context:
+            confirmed.append(h)
+            continue
+        rec = ledger.get(h["key"])
+        if rec is not None and h.get("pmcid") and not rec.metadata.get("passages"):
+            load_fulltext(http, ledger, h["key"], h["pmcid"])
+        ctx = variant_context(ledger.get(h["key"]), terms, nots)
+        if rec is not None:
+            rec.metadata["variant_context"] = ctx["status"]
+        (confirmed if ctx["status"] == "confirmed" else unconfirmed).append({**h, "variant_context": ctx})
+    status = "failed" if len(failures) == 2 else ("partial" if failures else "ok")
+    keys = sorted({r["key"] for r in confirmed} | {r["key"] for r in pm.get("results", [])})
+    ledger.log_query("variant_literature_search", {"gene": gene, "notations": nots}, keys,
+                     error="; ".join(f"{k}: {v}" for k, v in failures.items()))
+    return {"europepmc_fulltext_query": q, "europepmc": confirmed, "europepmc_hits": epmc.get("hit_count"),
+            "europepmc_unconfirmed": unconfirmed, "gene_anchor_terms": terms,
             "pubmed_query": pm_q, "pubmed": pm.get("results", []), "pubmed_hits": pm.get("total_count"),
-            "note": "A hit means the variant notation occurs somewhere in the article (often a patient table); it does not show "
-                    "that a reported individual's treatment response applies to this patient. Read the passage before citing."}
+            "status": status, "failures": failures,
+            "note": "Europe PMC hits are listed under 'europepmc' only if a passage of the accessible text mentions the variant "
+                    "together with the gene; others are in 'europepmc_unconfirmed' and are NOT evidence about this variant. "
+                    "PubMed hits match gene and notation in the same title/abstract. A hit does not show that a reported "
+                    "individual's treatment response applies to this patient. Read the passage before citing."}

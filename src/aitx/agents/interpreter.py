@@ -67,6 +67,8 @@ def bootstrap(ctx: CaseContext, http: HttpClient, ledger: EvidenceLedger, toolbo
             ledger.log_query("search_trials", {"term": g}, [], error=str(e)[:200])
     dossier["bootstrap_keys"] = ledger.keys()
     dossier["retrieval_status"] = ledger.retrieval_status()
+    dossier["coverage_failures"] = ncbi.coverage_failures(dossier.get("therapeutic_coverage") or {})
+    dossier["failed_queries"] = [{"tool": q.tool, "args": q.args, "error": q.error, "n_results": q.n_results} for q in ledger.failed_queries()]
     return dossier
 
 
@@ -79,17 +81,26 @@ def _vcf_str(vv: dict) -> str:
 
 def dossier_text(d: dict[str, Any], limit: int = 30000) -> str:
     slim = {
+        # first, so it is never cut by the length limit: failed/incomplete retrieval is NOT evidence of absence
+        "RETRIEVAL FAILURES AND INCOMPLETE SEARCHES (no conclusion about absence may be drawn from these)": {
+            "failed_queries": [{k: q.get(k) for k in ("tool", "args", "error")} for q in d.get("failed_queries", [])],
+            "coverage_failed_or_incomplete": d.get("coverage_failures", []),
+            "errors": d.get("errors"),
+        },
         "variants": d.get("variants"),
         "clinvar": d.get("clinvar"),
         "genes": d.get("genes"),
         "gene_summary": {g: {k: v.get(k) for k in ("key", "name", "description", "summary")} for g, v in (d.get("gene_summary") or {}).items()},
         "genereviews": d.get("genereviews"),
-        "variant_literature (articles mentioning the exact variant; read before citing)": [
-            {"europepmc": [{k: r.get(k) for k in ("key", "title", "year", "pmcid", "open_access")} for r in (x.get("europepmc") or [])[:15]],
+        "variant_literature (articles whose accessible text mentions the exact variant together with the gene; read before citing)": [
+            {"status": x.get("status"), "failures": x.get("failures"),
+             "europepmc": [{k: r.get(k) for k in ("key", "title", "year", "pmcid", "open_access")} for r in (x.get("europepmc") or [])[:15]],
+             "europepmc_unconfirmed_count (notation not shown in this gene's context: NOT variant evidence)": len(x.get("europepmc_unconfirmed") or []),
              "pubmed": [{k: r.get(k) for k in ("key", "title", "year")} for r in (x.get("pubmed") or [])[:10]]} for x in d.get("variant_literature", [])],
-        "therapeutic_coverage (mandatory queries; every hit must be assessed or explicitly set aside)": {
-            g: {fam: {"query": f["query"], "total": f["total"], "error": f["error"],
-                      "hits": [{"key": k, "title": f["titles"].get(k, "")} for k in f["keys"][:20]]} for fam, f in fams.items()}
+        "therapeutic_coverage (mandatory queries; every hit must be assessed or explicitly set aside; status failed/partial = coverage gap)": {
+            g: {fam: {"query": f["query"], "status": f.get("status"), "total": f["total"], "reviewed": len(f.get("keys", [])), "error": f["error"],
+                      "hits": [{"key": k, "title": f["titles"].get(k, "")[:110]} for k in f["keys"][:25]],
+                      "hits_not_shown": max(0, len(f.get("keys", [])) - 25)} for fam, f in fams.items()}
             for g, fams in (d.get("therapeutic_coverage") or {}).items()},
         "open_trials_by_gene_term": {g: [{k: s.get(k) for k in ("nct_id", "title", "overall_status", "study_type")} for s in v.get("studies", [])]
                                      for g, v in (d.get("trials_by_gene") or {}).items()},
