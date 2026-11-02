@@ -64,7 +64,8 @@ class Settings:
     effort: str = field(default_factory=lambda: _str("AITX_EFFORT", "high"))
     verifier_effort: str = field(default_factory=lambda: _str("AITX_VERIFIER_EFFORT", "medium"))
     enable_gemini: bool = False  # archived: Gemini is not used by any pipeline configuration (project decision 2026-11-02)
-    refusal_fallback: bool = field(default_factory=lambda: _bool("AITX_REFUSAL_FALLBACK", True))
+    # off by default: a fallback could serve a turn with another model; enable only when that is acceptable and accounted for
+    refusal_fallback: bool = field(default_factory=lambda: _bool("AITX_REFUSAL_FALLBACK", False))
     max_tool_rounds: int = field(default_factory=lambda: _int("AITX_MAX_TOOL_ROUNDS", 24))
     max_revisions: int = field(default_factory=lambda: _int("AITX_MAX_REVISIONS", 2))
     max_cost_usd_per_case: float = field(default_factory=lambda: _float("AITX_MAX_COST_USD_PER_CASE", 12.0))

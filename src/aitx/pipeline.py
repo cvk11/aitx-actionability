@@ -29,14 +29,14 @@ from .llm.base import BudgetExceeded, CostTracker, ModelRefusal, StructuredOutpu
 from .qc import check_links_against_ledger, check_report_structure, heuristic_scorecard
 from .render import render_report
 from .retrieval.registry import ToolBox
-from .rules import apply_citation_rules, apply_section_rules, apply_verdicts, find_cross_section_duplicates
+from .rules import apply_citation_rules, apply_section_rules, apply_verdicts, compose_from_verified_claims, find_cross_section_duplicates
 from .schemas import ActionItem, ClaimVerdict, PatientCase, ReportOutput, Section, Synthesis
 
 log = logging.getLogger(__name__)
 MOCK_BANNER = "> **MOCK OUTPUT — generated with the offline mock LLM; not genuine research and never to be submitted.**"
 
 
-OK_STATUS = ("supported", "not_checkable")
+OK_STATUS = ("supported", "not_checkable", "hypothesis", "composed_from_verified_claims")
 
 
 @dataclass
@@ -131,14 +131,18 @@ class Pipeline:
             outs = researcher.run_researchers(ctx, self.llm, toolbox, S.max_tool_rounds, parallel=self.parallel)
             audit["stages"]["BC_research_raw"] = {k: v.model_dump(mode="json") for k, v in outs.items()}
             items, negatives, open_q = researcher.merge_items(outs)
+            handoffs = researcher.collect_handoffs(outs)
             audit["stages"]["open_questions"] = open_q
+            audit["stages"]["candidate_handoffs"] = handoffs
+            vstate["vctx"] = verifier.VerifyContext.from_case(ctx)
+            genes = [v.gene for v in case.patient.genotype]
 
             # ---- deterministic rules (pass 1)
-            items, problems = self._rules(items, ledger, age, sex, audit)
+            items, problems = self._rules(items, ledger, age, sex, audit, genes)
 
             # ---- D verification (deterministic, then claim + statement entailment; fail closed)
             det = verifier.deterministic_checks(items, ledger, self.http)
-            items, problems2 = self._rules(items, ledger, age, sex, audit)  # live trial data may have changed
+            items, problems2 = self._rules(items, ledger, age, sex, audit, genes)  # live trial data may have changed
             _merge(problems, problems2)
             audit["stages"]["D_verification"] = {"deterministic": det}
             if self.verify_claims:
@@ -146,9 +150,13 @@ class Pipeline:
             else:
                 add_issue(audit, "critical", "verification_disabled", "claim verification disabled (ablation arm): report is not submittable")
 
+            # ---- candidate handoffs + open questions are researched, never silently dropped
+            if handoffs or open_q:
+                items, problems = self._handoffs(ctx, items, ledger, toolbox, age, sex, genes, problems, audit, vstate, handoffs, open_q)
+
             # ---- E optional independent review
             if self.reviewer_llm is not None:
-                items, problems = self._review(ctx, items, ledger, toolbox, age, sex, problems, audit, vstate)
+                items, problems = self._review(ctx, items, ledger, toolbox, age, sex, problems, audit, vstate, genes)
 
             # ---- bounded revision loop; every changed item is re-verified against its evidence
             for r in range(S.max_revisions):
@@ -166,7 +174,7 @@ class Pipeline:
                 items, rlog = synthesizer.apply_revisions(items, plan, ledger)
                 audit["stages"].setdefault("revisions", []).append({"round": r, "problems": problems, "applied": rlog})
                 changed = {x["item_id"] for x in rlog if x["action"] in ("revise", "move")}
-                items, problems = self._rules(items, ledger, age, sex, audit)
+                items, problems = self._rules(items, ledger, age, sex, audit, genes)
                 if changed and self.verify_claims:
                     ch = [i for i in items if i.item_id in changed]
                     kept = {i.item_id: i for i in self._verify(ch, ledger, vstate, problems, audit, f"revision{r}", statements_only=True)}
@@ -174,6 +182,16 @@ class Pipeline:
 
             # ---- final verification gate: only items whose FULL statement is verified are rendered
             if self.verify_claims:
+                salvaged = {}
+                for i in items:
+                    if vstate["status"].get(i.item_id, "unverified") not in OK_STATUS and i.section != Section.TRIALS:
+                        comp = compose_from_verified_claims(i, vstate["verdicts"].get(i.item_id, []))
+                        if comp is not None:
+                            salvaged[i.item_id] = comp
+                            vstate["status"][i.item_id] = "composed_from_verified_claims"
+                            add_issue(audit, "info", "statement_composed_from_verified_claims",
+                                      f"{i.item_id}: free-text statement not verifiable; rendered from its individually verified claims only")
+                items = [salvaged.get(i.item_id, i) for i in items]
                 bad = [i for i in items if vstate["status"].get(i.item_id, "unverified") not in OK_STATUS]
                 for i in bad:
                     add_issue(audit, "info", "item_dropped_statement_not_verified",
@@ -189,7 +207,7 @@ class Pipeline:
             if synthesis.duplicate_item_ids_to_drop:
                 items = [i for i in items if i.item_id not in set(synthesis.duplicate_item_ids_to_drop)]
             if self.verify_claims:
-                synthesis, scov, sev = synthesizer.verify_synthesis(synthesis, items, ledger, self.verifier_llm, S.verifier_effort)
+                synthesis, scov, sev = synthesizer.verify_synthesis(synthesis, items, ledger, self.verifier_llm, S.verifier_effort, vstate.get("vctx"))
                 audit["stages"]["F_synthesis_verification"] = {"coverage": scov, "events": sev}
                 if scov.get("missing_after_reverification"):
                     add_issue(audit, "critical", "synthesis_verification_incomplete", f"no decision for {scov['missing_after_reverification']}")
@@ -232,7 +250,7 @@ class Pipeline:
     def _finish(self, case, ctx, ledger, toolbox, audit, t0, items, synthesis, negatives, verdicts) -> CaseResult:
         # ---- render + QC (deterministic)
         evidence_date = time.strftime("%Y-%m-%d", time.gmtime())
-        md = render_report(case.id, items, synthesis, ledger, negatives, evidence_date)
+        md = render_report(case.id, items, synthesis, ledger, negatives, evidence_date, statement_status=audit.get("statement_status", {}))
         if self.is_mock:
             lines = md.split("\n", 1)
             md = lines[0] + "\n\n" + MOCK_BANNER + "\n" + (lines[1] if len(lines) > 1 else "")
@@ -275,7 +293,8 @@ class Pipeline:
         Updates vstate (statement status per item; re-indexed claim verdicts) and problems; returns kept items."""
         if not items:
             return []
-        vr = verifier.llm_verify(items, ledger, self.verifier_llm, self.settings.verifier_effort, statements_only=statements_only)
+        vr = verifier.llm_verify(items, ledger, self.verifier_llm, self.settings.verifier_effort, statements_only=statements_only,
+                                 vctx=vstate.get("vctx"))
         vstate["all"].extend(vr.verdicts)
         audit["stages"].setdefault("D_verification_rounds", []).append({"tag": tag, "coverage": vr.coverage,
                                                                          "verdicts": [v.model_dump(mode="json") for v in vr.verdicts]})
@@ -288,20 +307,41 @@ class Pipeline:
         _merge(problems, res.problems)
         for i in items:
             vstate["status"][i.item_id] = res.statement_status.get(i.item_id, "dropped")
+        audit["statement_status"] = vstate["status"]
         for iid in {v.item_id for v in res.reindexed}:
             vstate["verdicts"][iid] = [v for v in res.reindexed if v.item_id == iid]
         return res.items
 
-    def _rules(self, items, ledger, age, sex, audit):
+    def _rules(self, items, ledger, age, sex, audit, genes=None):
         c = apply_citation_rules(items, ledger)
-        s = apply_section_rules(c.items, ledger, age, sex)
+        s = apply_section_rules(c.items, ledger, age, sex, genes)
         audit["rule_events"] += [e.__dict__ for e in c.events + s.events]
         problems: dict[str, list[str]] = {}
         _merge(problems, c.problems)
         _merge(problems, s.problems)
         return s.items, problems
 
-    def _review(self, ctx, items, ledger, toolbox, age, sex, problems, audit, vstate):
+    def _handoffs(self, ctx, items, ledger, toolbox, age, sex, genes, problems, audit, vstate, handoffs, open_q):
+        """Research every cross-section handoff and open question once (bounded), with provenance; verify like all items."""
+        requests = [f"[{h['handoff_id']}] {h['intervention']} -> proposed section {h['proposed_section']}: {h['reason']} "
+                    f"(cites: {', '.join(h['citations'])})" for h in handoffs] + [f"[open question] {q}" for q in open_q[:6]]
+        fu = researcher.followup(ctx, self.llm, toolbox, requests[:10], items, max_rounds=min(10, self.settings.max_tool_rounds))
+        seen = {i.item_id for i in items}
+        new_items = [it.model_copy(update={"item_id": researcher.unique_id(f"ho-{it.item_id}", seen)}) for it in fu.items]
+        new_items, p = self._rules(new_items, ledger, age, sex, audit, genes)
+        verifier.deterministic_checks(new_items, ledger, self.http)
+        new_items, p2 = self._rules(new_items, ledger, age, sex, audit, genes)
+        _merge(problems, p)
+        _merge(problems, p2)
+        kept = self._verify(new_items, ledger, vstate, problems, audit, "handoffs") if self.verify_claims else new_items
+        audit["stages"]["handoff_followup"] = {"requests": requests, "raw": fu.model_dump(mode="json"), "kept": [i.item_id for i in kept],
+                                               "not_confirmed": fu.searched_but_not_found}
+        for h in handoffs:
+            if not any(h["intervention"].lower()[:20] in (i.title + " " + i.statement).lower() for i in kept):
+                add_issue(audit, "info", "handoff_not_confirmed", f"{h['handoff_id']} {h['intervention']}: not confirmed by verified evidence")
+        return items + kept, problems
+
+    def _review(self, ctx, items, ledger, toolbox, age, sex, problems, audit, vstate, genes=None):
         rep = rev.review(ctx, self.reviewer_llm, items, ledger)
         adj = rev.adjudicate(rep, self.llm, items, ledger)
         decisions = {d.issue_index: d for d in adj.decisions}
@@ -318,10 +358,11 @@ class Pipeline:
                                        "adjudication": adj.model_dump(mode="json"), "research_requests": requests}
         if requests:
             fu = researcher.followup(ctx, self.llm, toolbox, requests[:6], items, max_rounds=min(10, self.settings.max_tool_rounds))
-            new_items = [it.model_copy(update={"item_id": f"fu-{it.item_id}"}) for it in fu.items]
-            new_items, p = self._rules(new_items, ledger, age, sex, audit)
+            seen = {i.item_id for i in items}
+            new_items = [it.model_copy(update={"item_id": researcher.unique_id(f"fu-{it.item_id}", seen)}) for it in fu.items]
+            new_items, p = self._rules(new_items, ledger, age, sex, audit, genes)
             verifier.deterministic_checks(new_items, ledger, self.http)
-            new_items, p2 = self._rules(new_items, ledger, age, sex, audit)
+            new_items, p2 = self._rules(new_items, ledger, age, sex, audit, genes)
             _merge(problems, p)
             _merge(problems, p2)
             kept = self._verify(new_items, ledger, vstate, problems, audit, "followup")

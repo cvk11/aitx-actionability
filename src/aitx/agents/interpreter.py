@@ -9,7 +9,7 @@ from typing import Any
 from .. import prompts
 from ..http import HttpClient
 from ..ledger import EvidenceLedger
-from ..retrieval import clinicaltrials, genereviews, ncbi, variant
+from ..retrieval import clinicaltrials, europepmc, genereviews, ncbi, variant
 from ..retrieval.registry import ToolBox
 from ..schemas import Interpretation
 from .context import CaseContext
@@ -31,10 +31,19 @@ def bootstrap(ctx: CaseContext, http: HttpClient, ledger: EvidenceLedger, toolbo
             a = {"error": str(e)}
             dossier["errors"].append(f"annotate {v.gene}: {e}")
         dossier["variants"].append(a)
+        try:  # variant-centric literature (full text + tables), so variant-specific reports are not missed
+            from ..evidence import variant_notations
+
+            rs = [c["id"] for c in ((a.get("vep") or {}).get("colocated_germline") or []) if str(c.get("id", "")).startswith("rs")]
+            dossier.setdefault("variant_literature", []).append(
+                europepmc.variant_literature_search(http, ledger, v.gene, sorted(variant_notations(v.variant_cdna, v.variant_protein, rs))))
+        except Exception as e:  # pragma: no cover - network
+            dossier["errors"].append(f"variant literature {v.gene}: {e}")
+            ledger.log_query("variant_literature_search", {"gene": v.gene}, [], error=str(e)[:200])
         genes.setdefault(v.gene, (a.get("computed_features") or {}).get("aa_position"))
         try:
             dossier["clinvar"].append(ncbi.clinvar_lookup(http, ledger, v.gene, v.variant_cdna, v.transcript, hgvs_p=v.variant_protein,
-                                                       genomic_vcf=_vcf_str((a.get("variantvalidator") or {}).get("vcf_grch38"))))
+                                                       genomic_vcf=_vcf_str(a.get("variantvalidator") or {})))
         except Exception as e:  # pragma: no cover
             dossier["errors"].append(f"clinvar {v.gene}: {e}")
             ledger.log_query("clinvar_lookup", {"gene": v.gene, "hgvs_c": v.variant_cdna}, [], error=str(e)[:200])
@@ -57,8 +66,11 @@ def bootstrap(ctx: CaseContext, http: HttpClient, ledger: EvidenceLedger, toolbo
     return dossier
 
 
-def _vcf_str(v: dict | None) -> str:
-    return f"{v['chr']}-{v['pos']}-{v['ref']}-{v['alt']}" if v and all(k in v for k in ("chr", "pos", "ref", "alt")) else ""
+def _vcf_str(vv: dict) -> str:
+    """'NC_xxxxxx.v-pos-ref-alt' from VariantValidator (accession version preserved; '' if unavailable)."""
+    v = vv.get("vcf_grch38") or {}
+    acc = (vv.get("genomic_grch38") or "").split(":")[0]
+    return f"{acc}-{v['pos']}-{v['ref']}-{v['alt']}" if acc and all(k in v for k in ("pos", "ref", "alt")) else ""
 
 
 def dossier_text(d: dict[str, Any], limit: int = 30000) -> str:
@@ -68,6 +80,9 @@ def dossier_text(d: dict[str, Any], limit: int = 30000) -> str:
         "genes": d.get("genes"),
         "gene_summary": {g: {k: v.get(k) for k in ("key", "name", "description", "summary")} for g, v in (d.get("gene_summary") or {}).items()},
         "genereviews": d.get("genereviews"),
+        "variant_literature (articles mentioning the exact variant; read before citing)": [
+            {"europepmc": [{k: r.get(k) for k in ("key", "title", "year", "pmcid", "open_access")} for r in (x.get("europepmc") or [])[:15]],
+             "pubmed": [{k: r.get(k) for k in ("key", "title", "year")} for r in (x.get("pubmed") or [])[:10]]} for x in d.get("variant_literature", [])],
         "open_trials_by_gene_term": {g: [{k: s.get(k) for k in ("nct_id", "title", "overall_status", "study_type")} for s in v.get("studies", [])]
                                      for g, v in (d.get("trials_by_gene") or {}).items()},
         "errors": d.get("errors"),

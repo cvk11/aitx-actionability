@@ -49,6 +49,69 @@ def _paragraphs(xml_text: str) -> list[tuple[str, str]]:
     return out
 
 
+def fulltext_passages(xml_text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """All section paragraphs AND table rows of a PMC/JATS full text, location-labelled, plus supplementary file names.
+    Table rows keep their caption and header so patient-level rows remain attributable."""
+    root = ET.fromstring(xml_text)
+    out: list[tuple[str, str]] = []
+    for sec in root.iter("sec"):
+        title = re.sub(r"\s+", " ", "".join(sec.findtext("title") or "")).strip() or "section"
+        for p_el in sec.findall("p"):
+            t = re.sub(r"\s+", " ", "".join(p_el.itertext())).strip()
+            if t:
+                out.append((title, t))
+    for n, tw in enumerate(root.iter("table-wrap"), start=1):
+        label = re.sub(r"\s+", " ", "".join(tw.findtext("label") or f"Table {n}")).strip()
+        cap_el = tw.find("caption")
+        cap = re.sub(r"\s+", " ", " ".join(cap_el.itertext())).strip()[:200] if cap_el is not None else ""
+        header = ""
+        for i, tr in enumerate(tw.iter("tr")):
+            cells = [re.sub(r"\s+", " ", " ".join(c.itertext())).strip() for c in tr if c.tag in ("td", "th")]
+            row = " | ".join(cells)
+            if not row:
+                continue
+            if i == 0 and all(c.tag == "th" for c in tr if c.tag in ("td", "th")):
+                header = row
+                continue
+            out.append((f"{label}{': ' + cap if cap else ''}", (f"[{header}] " if header else "") + row))
+    supp = []
+    for sm in root.iter("supplementary-material"):
+        href = next((v for k, v in sm.attrib.items() if k.endswith("href")), "") or ""
+        lab = re.sub(r"\s+", " ", " ".join(sm.itertext())).strip()[:120]
+        supp.append(href or lab)
+    return out, supp
+
+
+def load_fulltext(http: HttpClient, ledger: EvidenceLedger, key: str, pmcid: str) -> str:
+    """Attach all full-text passages (incl. tables) of an open-access PMC article to an existing ledger record.
+    Returns 'loaded' | 'not_open_access' | 'failed'. Never raises."""
+    rec = ledger.get(key)
+    if rec is None:
+        return "failed"
+    pmcid = pmcid.strip().upper()
+    if not pmcid.startswith("PMC"):
+        pmcid = "PMC" + pmcid
+    try:
+        r = http.request("GET", f"{BASE}/{pmcid}/fullTextXML")
+    except Exception:
+        rec.metadata["fulltext_status"] = "failed"
+        return "failed"
+    if r.status != 200 or "<" not in r.text[:10]:
+        rec.metadata["fulltext_status"] = "not_open_access" if r.status in (404, 400) else "failed"
+        return rec.metadata["fulltext_status"]
+    try:
+        ps, supp = fulltext_passages(r.text)
+    except ET.ParseError:
+        rec.metadata["fulltext_status"] = "failed"
+        return "failed"
+    rec.metadata["passages"] = ps
+    rec.metadata["supplementary_files"] = supp
+    rec.metadata["fulltext_status"] = "loaded" + ("; supplementary files listed but not parsed" if supp else "")
+    rec.metadata["pmcid"] = pmcid
+    rec.content_scope = "full_text_excerpt"
+    return "loaded"
+
+
 def europepmc_fulltext_excerpts(http: HttpClient, ledger: EvidenceLedger, pmcid: str, keywords: list[str], max_paragraphs: int = 12) -> dict[str, Any]:
     pmcid = pmcid.strip().upper()
     if not pmcid.startswith("PMC"):
@@ -58,6 +121,11 @@ def europepmc_fulltext_excerpts(http: HttpClient, ledger: EvidenceLedger, pmcid:
         ledger.log_query("europepmc_fulltext_excerpts", {"pmcid": pmcid, "keywords": keywords}, [], error=f"HTTP {r.status}")
         return {"error": f"Full text not available (HTTP {r.status}); only open-access PMC articles are retrievable."}
     paras = _paragraphs(r.text)
+    try:
+        all_passages, supp = fulltext_passages(r.text)
+    except ET.ParseError:
+        all_passages, supp = [], []
+    paras = paras + [(loc, t) for loc, t in all_passages if loc.lower().startswith("table")]
     kws = [k.lower() for k in keywords if k.strip()]
     scored = []
     for i, (title, t) in enumerate(paras):
@@ -81,5 +149,31 @@ def europepmc_fulltext_excerpts(http: HttpClient, ledger: EvidenceLedger, pmcid:
     if rec.content_scope != "full_text_excerpt" and excerpt:
         rec.content = (rec.content + "\n[FULL-TEXT EXCERPTS]\n" + excerpt)[:20000]
         rec.content_scope = "full_text_excerpt"
+    rec.metadata["passages"] = all_passages
+    rec.metadata["supplementary_files"] = supp
+    rec.metadata["fulltext_status"] = "loaded" + ("; supplementary files listed but not parsed" if supp else "")
     ledger.log_query("europepmc_fulltext_excerpts", {"pmcid": pmcid, "keywords": keywords}, [key])
-    return {"key": key, "title": art_title, "n_paragraphs_total": len(paras), "excerpts": excerpt}
+    return {"key": key, "title": art_title, "n_paragraphs_total": len(paras), "n_table_rows": sum(1 for l, _ in all_passages if l.lower().startswith("table")),
+            "supplementary_files": supp[:10], "excerpts": excerpt}
+
+
+def variant_literature_search(http: HttpClient, ledger: EvidenceLedger, gene: str, notations: list[str], extra_terms: list[str] | None = None,
+                              max_results: int = 25) -> dict[str, Any]:
+    """Variant-centric literature search. PubMed indexes titles/abstracts only, so variant notations that appear only
+    in full text or patient tables are searched in Europe PMC full text as well (open-access articles)."""
+    nots = [n for n in dict.fromkeys(notations) if n]
+    if not gene or not nots:
+        return {"error": "gene and at least one variant notation required"}
+    ors = " OR ".join(f'"{n}"' for n in nots)
+    q = f'"{gene}" AND ({ors})' + (" AND (" + " OR ".join(f'"{t}"' for t in extra_terms) + ")" if extra_terms else "")
+    epmc = europepmc_search(http, ledger, q, max_results)
+    from .ncbi import pubmed_search
+
+    pm_q = f"{gene}[tiab] AND (" + " OR ".join(f'"{n}"[tiab]' for n in nots) + ")"
+    pm = pubmed_search(http, ledger, pm_q, max_results)
+    ledger.log_query("variant_literature_search", {"gene": gene, "notations": nots},
+                     sorted({r["key"] for r in epmc.get("results", [])} | {r["key"] for r in pm.get("results", [])}))
+    return {"europepmc_fulltext_query": q, "europepmc": epmc.get("results", []), "europepmc_hits": epmc.get("hit_count"),
+            "pubmed_query": pm_q, "pubmed": pm.get("results", []), "pubmed_hits": pm.get("total_count"),
+            "note": "A hit means the variant notation occurs somewhere in the article (often a patient table); it does not show "
+                    "that a reported individual's treatment response applies to this patient. Read the passage before citing."}

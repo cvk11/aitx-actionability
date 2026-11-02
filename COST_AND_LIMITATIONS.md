@@ -34,7 +34,7 @@ How the guard works (`src/aitx/llm/base.py::CostTracker`, `src/aitx/llm/anthropi
 ## 4. Prepared first real inference — AITX-40002 (ITPR1) — NOT RUN
 Owner budget ≈ $32. Recommended command (after explicit authorization and setting the key in `.env`, never in chat):
 ```bash
-AITX_MAX_TOOL_ROUNDS=16 AITX_MAX_COST_USD_PER_CASE=12 AITX_CALL_RESERVE_USD=1.5 python scripts/run_one.py --case-id AITX-40002 --config B_full
+AITX_MAX_TOOL_ROUNDS=16 AITX_MAX_COST_USD_PER_CASE=12 AITX_CALL_RESERVE_USD=0.25 AITX_REFUSAL_FALLBACK=false python scripts/run_one.py --case-id AITX-40002 --config B_full
 ```
 Model-based estimate ≈ $5.5–7.5 (not a measurement; includes the fail-closed re-verification and synthesis verification); application guard $12 plus an independent provider-side limit. This would leave ≈ $20 — enough for the arm-A baseline on the same case (≈ $2–4) and one more full case, **not** for all four cases plus A/B/C plus repeated-run robustness (≈ $30–50 for four cases alone). A larger budget is needed before the final submission run.
 

@@ -37,8 +37,22 @@ from pydantic import ValidationError  # noqa: E402
 from aitx.config import get_settings  # noqa: E402
 from aitx.schemas import PatientCase  # noqa: E402
 
-logging.basicConfig(level=logging.WARNING)  # never INFO/DEBUG in deployment: no payload content is logged anywhere
+logging.basicConfig(level=logging.WARNING)
+if os.environ.get("AITX_DEPLOYMENT_MODE", "").lower() in ("1", "true", "yes", "on"):
+    # pipeline/tool log messages can contain gene/variant/clinical text: silence them entirely in deployment
+    for name in ("aitx", "httpx", "httpcore", "anthropic"):
+        logging.getLogger(name).setLevel(logging.CRITICAL + 1)
 log = logging.getLogger("aitx.deployment")
+
+
+class ReportUnavailable(RuntimeError):
+    """Raised when the pipeline could not complete a fully verified report (no partial report is returned)."""
+
+
+def _safe_validation_message(e: ValidationError) -> str:
+    # field locations only — never echo submitted values (patient data)
+    locs = sorted({".".join(str(x) for x in err.get("loc", ())) for err in e.errors()})
+    return "Invalid input at: " + ", ".join(locs[:10])
 
 _gr_lock = threading.Lock()
 _gr_ready = threading.Event()
@@ -71,7 +85,13 @@ def _pipeline_factory():
 def _run_one(obj: dict[str, Any]) -> dict[str, Any]:
     case = PatientCase.model_validate(obj)  # raises ValidationError on malformed input
     _gr_ready.wait(timeout=3600)
-    result = _pipeline_factory().run(case)  # nothing is persisted in deployment mode
+    try:
+        result = _pipeline_factory().run(case)  # nothing is persisted in deployment mode
+    except Exception as e:  # never surface exception text (may contain patient data)
+        raise ReportUnavailable(f"report generation failed ({type(e).__name__})") from None
+    blockers = [b["code"] for b in result.blockers if b["code"] != "mock_output"]
+    if blockers:
+        raise ReportUnavailable("report incomplete or not fully verified (" + ", ".join(sorted(set(blockers))) + "); please retry")
     return result.output.model_dump()
 
 
@@ -96,8 +116,12 @@ def build_app():
     def gr_fn(payload):
         try:
             return actionability_report(payload)
-        except (ValidationError, ValueError) as e:
-            raise gr.Error(f"Invalid input: {str(e)[:500]}")
+        except ValidationError as e:
+            raise gr.Error(_safe_validation_message(e))
+        except ReportUnavailable as e:
+            raise gr.Error(str(e))
+        except ValueError:
+            raise gr.Error("Invalid input: expected a JSON object (or array) in the AI-Tx input format")
 
     demo = gr.Interface(
         fn=gr_fn, inputs=gr.JSON(label="AI-Tx input object"), outputs=gr.JSON(label="AI-Tx output object"),
@@ -110,8 +134,12 @@ def build_app():
     def http_endpoint(payload: Any = Body(...)):
         try:
             return JSONResponse(actionability_report(payload))
-        except (ValidationError, ValueError) as e:
-            raise HTTPException(status_code=422, detail=f"Invalid input: {str(e)[:500]}")
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=_safe_validation_message(e))
+        except ReportUnavailable as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid input: expected a JSON object (or array) in the AI-Tx input format")
 
     @app.get("/healthz")
     def health():

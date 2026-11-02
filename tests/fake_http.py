@@ -52,6 +52,18 @@ STUDY_CLOSED = {"protocolSection": {
 }}
 
 
+FILLER = " ".join(["Background paragraph about the disease and its history."] * 80)  # pushes the table far beyond 3,500 characters
+FULLTEXT_XML = f"""<?xml version="1.0"?><article><front><article-meta><article-id pub-id-type="pmid">11111111</article-id>
+<title-group><article-title>Drug Q treatment in a child with GENEX-related epilepsy</article-title></title-group></article-meta></front>
+<body><sec><title>Introduction</title><p>{FILLER}</p></sec>
+<sec><title>Results</title><p>Seizure frequency decreased by 50% after drug Q was started in patient 2.</p>
+<table-wrap id="t1"><label>Table 1</label><caption><p>Genotype and treatment response</p></caption><table>
+<thead><tr><th>Patient</th><th>Variant</th><th>Treatment</th><th>Response</th></tr></thead>
+<tbody><tr><td>P1</td><td>c.200G>T (p.Gly67Val)</td><td>drug Z</td><td>worsened</td></tr>
+<tr><td>P2</td><td>c.100G>A (p.Asp34Asn)</td><td>drug Q</td><td>50% seizure reduction at 12 months</td></tr></tbody></table></table-wrap>
+</sec></body><back><sec><supplementary-material xlink:href="supp1.xlsx" xmlns:xlink="http://www.w3.org/1999/xlink"><label>Table S1</label></supplementary-material></sec></back></article>"""
+
+
 def _j(obj, status=200):
     return httpx.Response(status, json=obj)
 
@@ -120,6 +132,10 @@ def handler(request: httpx.Request) -> httpx.Response:
     if host == "api.fda.gov":
         return _j({"results": [{"set_id": "set-q", "effective_time": "20250101", "openfda": {"generic_name": ["DRUG Q"], "brand_name": ["Qbrand"]},
                                 "indications_and_usage": ["Drug Q is indicated for seizures."], "contraindications": ["Hypersensitivity."]}]})
+    if host == "www.ebi.ac.uk" and path.endswith("/PMC1111111/fullTextXML"):
+        return httpx.Response(200, text=FULLTEXT_XML)
+    if host == "www.ebi.ac.uk" and path.endswith("fullTextXML"):
+        return httpx.Response(404, text="not open access")
     if host == "www.ebi.ac.uk":
         return _j({"hitCount": 1, "resultList": {"result": [{"id": "11111111", "source": "MED", "pmid": "11111111", "pmcid": "PMC1111111", "title": "Drug Q case", "pubYear": "2022", "isOpenAccess": "Y"}]}})
     if host == "api.clinpgx.org":

@@ -224,12 +224,10 @@ def _resolve_genomic(http: HttpClient, transcript: str, hgvs_c: str) -> tuple | 
 
         vv = variantvalidator(http, transcript, hgvs_c)
         v = vv.get("vcf_grch38") if vv.get("ok") else None
-        return _norm_vcf(f"{v['chr']}-{v['pos']}-{v['ref']}-{v['alt']}") if v else None
+        acc = (vv.get("genomic_grch38") or "").split(":")[0]
+        return _norm_vcf(f"{acc}-{v['pos']}-{v['ref']}-{v['alt']}") if v and acc else None
     except Exception:
         return None
-
-
-_CHR = {**{f"NC_{i:06d}": str(i) for i in range(1, 23)}, "NC_000023": "X", "NC_000024": "Y", "NC_012920": "MT"}
 
 
 def _trim(chrom: str, pos0: int, ref: str, alt: str) -> tuple:
@@ -241,13 +239,15 @@ def _trim(chrom: str, pos0: int, ref: str, alt: str) -> tuple:
         ref, alt = ref[:-1], alt[:-1]
     while ref and alt and ref[0] == alt[0]:
         ref, alt, pos0 = ref[1:], alt[1:], pos0 + 1
-    return (chrom.removeprefix("chr").upper(), pos0, ref, alt)
+    return (chrom, pos0, ref, alt)
 
 
 def _norm_vcf(v: str) -> tuple | None:
-    """'7-117559590-ATCT-A' (VCF, 1-based) -> minimal allele tuple."""
-    parts = re.split(r"[-:]", v.strip())
-    if len(parts) != 4 or not parts[1].isdigit():
+    """'NC_000007.14-117559590-ATCT-A' (versioned RefSeq accession, VCF 1-based) -> minimal allele tuple.
+    The accession VERSION is kept, so a GRCh37 (e.g. NC_000007.13) allele can never match a GRCh38 one.
+    A bare chromosome name is rejected (assembly unknown)."""
+    parts = v.strip().split("-")
+    if len(parts) != 4 or not parts[1].isdigit() or not re.fullmatch(r"N[CTW]_\d+\.\d+", parts[0]):
         return None
     return _trim(parts[0], int(parts[1]) - 1, parts[2], parts[3])
 
@@ -255,10 +255,9 @@ def _norm_vcf(v: str) -> tuple | None:
 def _norm_spdi(spdi: str) -> tuple | None:
     """'NC_000007.14:117559590:TCTT:T' (SPDI, 0-based) -> minimal allele tuple."""
     parts = spdi.split(":")
-    if len(parts) != 4 or not parts[1].isdigit():
+    if len(parts) != 4 or not parts[1].isdigit() or not re.fullmatch(r"N[CTW]_\d+\.\d+", parts[0]):
         return None
-    chrom = _CHR.get(parts[0].split(".")[0])
-    return _trim(chrom, int(parts[1]), parts[2], parts[3]) if chrom else None
+    return _trim(parts[0], int(parts[1]), parts[2], parts[3])
 
 
 def _clinvar_grch38(r: dict[str, Any]) -> tuple | None:

@@ -86,7 +86,17 @@ def _ensure_period(s: str) -> str:
     return s if not s or s[-1] in ".!?)" else s + "."
 
 
-def render_item(item: ActionItem, ledger: EvidenceLedger, accessed: dict[str, str]) -> str:
+STATUS_NOTE = {
+    "hypothesis": " *Hypothesis: mechanistic inference built on the verified facts cited; not an established benefit.*",
+    "composed_from_verified_claims": " *Statement composed only from individually verified claims.*",
+}
+
+
+def render_item(item: ActionItem, ledger: EvidenceLedger, accessed: dict[str, str], status: str = "") -> str:
+    return _render_item(item, ledger, accessed) + STATUS_NOTE.get(status, "")
+
+
+def _render_item(item: ActionItem, ledger: EvidenceLedger, accessed: dict[str, str]) -> str:
     stmt = _ensure_period(link_citations(item.statement, ledger))
     cond = f" {_ensure_period(link_citations(item.conditional_action, ledger))}" if item.conditional_action.strip() else ""
     ev = f" *Evidence level: {EVIDENCE_LABEL.get(item.evidence_level, item.evidence_level)}.*"
@@ -183,7 +193,8 @@ def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dic
 
 
 def render_report(case_id: str, items: list[ActionItem], synthesis: Synthesis, ledger: EvidenceLedger,
-                  negatives: dict[Section, list[str]] | None = None, evidence_date: str = "") -> str:
+                  negatives: dict[Section, list[str]] | None = None, evidence_date: str = "", statement_status: dict[str, str] | None = None) -> str:
+    statement_status = statement_status or {}
     negatives = negatives or {}
     by_sec: dict[Section, list[ActionItem]] = defaultdict(list)
     for it in items:
@@ -216,7 +227,7 @@ def render_report(case_id: str, items: list[ActionItem], synthesis: Synthesis, l
             L += [f"### {SECTION_HEADING[sec]}", ""]
             its = by_sec.get(sec, [])
             if its:
-                L += [render_item(it, ledger, accessed) for it in its]
+                L += [render_item(it, ledger, accessed, statement_status.get(it.item_id, "")) for it in its]
             else:
                 L.append(_negative_statement(sec, ledger, negatives))
             L.append("")
@@ -229,6 +240,19 @@ def render_report(case_id: str, items: list[ActionItem], synthesis: Synthesis, l
                     L.append(f"  - **Safety metrics:** {_ensure_period(link_citations(om.safety_metrics, ledger))}")
                     L.append(f"  - **Efficacy metrics:** {_ensure_period(link_citations(om.efficacy_metrics, ledger))}")
                     L.append(f"  - **Preclinical testing:** {_ensure_period(link_citations(om.preclinical_testing, ledger))}" + (f" Source: {src}." if src else ""))
+            elif by_sec.get(Section.BESPOKE) or by_sec.get(Section.REPURPOSING):
+                # never contradict the Tier-3 items above: rank them deterministically by verified evidence level
+                t3 = [i for i in by_sec.get(Section.BESPOKE, []) + by_sec.get(Section.REPURPOSING, []) if i.bespoke_verdict != "NOT AMENABLE"]
+                order = ["regulatory_approval", "guideline_or_expert_review", "human_same_variant", "human_same_gene", "human_related_disease_or_mechanism",
+                         "preclinical_same_gene", "preclinical_related", "mechanistic_inference", "trial_registry_record", "none"]
+                t3.sort(key=lambda i: (order.index(i.evidence_level) if i.evidence_level in order else 99, i.priority, i.item_id))
+                if not t3:
+                    L.append("- No hypothesized action is recommended (all assessed bespoke strategies were judged not amenable); outcome measures and ranking are therefore not applicable.")
+                for n, i in enumerate(t3, start=1):
+                    L.append(f"- **{n}. {i.title.strip().rstrip(':')}:** ranked by verified evidence level ({EVIDENCE_LABEL.get(i.evidence_level, i.evidence_level)}).")
+                    L.append("  - **Safety metrics:** Not verified in this run; must be defined (modality-specific) before any preclinical or clinical use.")
+                    L.append("  - **Efficacy metrics:** Not verified in this run; objective, age-appropriate measures must be specified.")
+                    L.append("  - **Preclinical testing:** Required before any use; specific studies were not verified in this run.")
             else:
                 L.append("- No hypothesized action is recommended with sufficient rationale; outcome measures and ranking are therefore not applicable.")
             L.append("")

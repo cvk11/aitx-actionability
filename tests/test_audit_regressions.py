@@ -29,8 +29,10 @@ def _item(iid, section, claims, statement="Statement [PMID:1].", **kw):
                       claims=[{"text": t, "citations": c, "kind": k} for t, c, k in claims], missing_information=[], **kw)
 
 
-def _v(iid, idx, verdict="supported", ev="direct_human_same_gene", rev=""):
+def _v(iid, idx, verdict="supported", ev="direct_human_same_gene", rev="", quote="A child was treated with drug Q", key="PMID:1",
+       app="same_gene_same_mechanism", im=True):
     return ClaimVerdict(item_id=iid, claim_index=idx, verdict=verdict, evidence_type=ev, overgeneralization="", abstract_only=False,
+                        supporting_quote=quote, quote_source_key=key, applicability=app, intervention_matches=im,
                         rationale="r", suggested_revision=rev)
 
 
@@ -114,9 +116,9 @@ def test_b4_clinvar_transcript_version_needs_genomic_equivalence(settings):
     assert r["records"] == [] and "CLINVAR:VCV000000123" not in L
     assert r["version_mismatch_candidates"]
     # same c. on another version is accepted only when GRCh38 coordinates/alleles match the patient's variant
-    r2 = ncbi.clinvar_lookup(http, L, "GENEX", "c.100G>A", "NM_999999.2", genomic_vcf="1-1000-G-A")
+    r2 = ncbi.clinvar_lookup(http, L, "GENEX", "c.100G>A", "NM_999999.2", genomic_vcf="NC_000001.11-1000-G-A")
     assert [x["key"] for x in r2["records"]] == ["CLINVAR:VCV000000123"] and r2["records"][0]["match"] == "genomic_equivalent_other_transcript_version"
-    r3 = ncbi.clinvar_lookup(http, EvidenceLedger(), "GENEX", "c.100G>A", "NM_999999.2", genomic_vcf="1-1000-G-T")
+    r3 = ncbi.clinvar_lookup(http, EvidenceLedger(), "GENEX", "c.100G>A", "NM_999999.2", genomic_vcf="NC_000001.11-1000-G-T")
     assert r3["records"] == []
 
 
@@ -133,9 +135,11 @@ def test_b4_vep_never_falls_back_to_another_transcript(settings):
 
 # ---------------------------------------------------------------------- B5
 def test_b5_word_patient_is_not_human_treatment_precedent():
+    """A mouse study that says 'no patients received the drug' is not human precedent. (Placement is now decided
+    after verification from verified evidence; the former publication-type pre-filter was removed — see test_s3.)"""
     L = _ledger_human_and_mouse()
     it = _item("off-m", Section.OFF_LABEL, [("Drug Q improved mice.", ["PMID:2"], "treatment_effect_preclinical")], statement="Drug Q [PMID:2].")
-    res = apply_section_rules([it], L, 5.0, "female")
+    res = apply_verdicts([it], [_v("off-m", 0, ev="preclinical", quote="Mice were treated", key="PMID:2"), _v("off-m", -1)], ledger=L)
     assert res.items[0].section != Section.OFF_LABEL
 
 
@@ -324,6 +328,6 @@ def test_b4_indel_equivalence_uses_identical_normalisation():
     describe the same deletion; raw coordinates differ (HGVS 3'-shifted g.117559592_117559594del)."""
     from aitx.retrieval.ncbi import _norm_spdi, _norm_vcf
 
-    assert _norm_vcf("7-117559590-ATCT-A") == _norm_spdi("NC_000007.14:117559590:TCTT:T")
-    assert _norm_vcf("7-117559590-ATCTT-A") != _norm_spdi("NC_000007.14:117559590:TCTT:T")  # 4-bp vs 3-bp deletion
-    assert _norm_vcf("3-4521031-G-A") != _norm_spdi("NC_000003.12:4521030:G:T")
+    assert _norm_vcf("NC_000007.14-117559590-ATCT-A") == _norm_spdi("NC_000007.14:117559590:TCTT:T")
+    assert _norm_vcf("NC_000007.14-117559590-ATCTT-A") != _norm_spdi("NC_000007.14:117559590:TCTT:T")  # 4-bp vs 3-bp deletion
+    assert _norm_vcf("NC_000003.12-4521031-G-A") != _norm_spdi("NC_000003.12:4521030:G:T")

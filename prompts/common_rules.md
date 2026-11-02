@@ -13,6 +13,8 @@ Evidence and citation rules:
 8. When nothing qualifies for a section, say so plainly and record what was searched. Do not pad sections with weak or irrelevant items.
 9. Put each action in exactly one best-fitting section. If the patient has more than one genetic diagnosis, state in each item which diagnosis it addresses.
 10. Absence of evidence is not evidence of absence. Keep three cases distinct and say which applies: (a) "not found in <source> (searched <date>)" — the query ran and returned no record; (b) "retrieval from <source> failed" — the source could not be queried, so nothing can be concluded; (c) a confirmed negative — an authoritative source explicitly states it (e.g., a guideline stating no disease-specific therapy exists). Never turn (a) or (b) into a claim that something does not exist biologically or clinically.
+11. Variant-specific evidence lives in full texts and patient tables more often than in abstracts. Use `variant_literature_search` and `europepmc_fulltext_excerpts` (which return table rows) before concluding that nothing is reported for this variant. A source describing a NEIGHBOURING variant or a different functional class is not evidence about this variant's mechanism or treatment response. If a needed table or full text is not accessible, say so ("could not be assessed") instead of treating the claim as false.
+12. Never drop a candidate you found for another section: record it in `candidate_handoffs` (intervention, proposed section, reason, citations); it will be researched and verified separately.
 
 Official section definitions (verbatim from the organizers' template):
 - Existing Targeted Therapies: Approved or guideline-supported treatments directed at the underlying molecular defect or disease mechanism.

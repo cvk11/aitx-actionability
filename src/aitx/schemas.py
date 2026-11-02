@@ -148,12 +148,24 @@ class ActionItem(BaseModel):
     human_precedent: str = Field(default="", description="Off-label: who received it, with what outcome. Repurposing: ''.")
 
 
+class CandidateHandoff(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intervention: str
+    proposed_section: Section
+    reason: str
+    citations: list[str]
+
+
 class SectionResearchOutput(BaseModel):
     """Output of one section-group researcher."""
 
     model_config = ConfigDict(extra="forbid")
 
     items: list[ActionItem]
+    candidate_handoffs: list["CandidateHandoff"] = Field(
+        description="Therapeutic candidates found during this research that belong to ANOTHER section (e.g. human precedent "
+                    "found while researching repurposing). They are researched and verified in a follow-up step, never dropped.")
     searched_but_not_found: list[str] = Field(
         description="Explicit negative findings, e.g. 'No FDA-approved therapy targeting <GENE> was found in openFDA labels or GeneReviews.'"
     )
@@ -220,7 +232,16 @@ class Interpretation(BaseModel):
 # Agent D — verification
 # --------------------------------------------------------------------------
 
-Verdict = Literal["supported", "partially_supported", "unsupported", "contradicted", "not_checkable"]
+Verdict = Literal["supported", "partially_supported", "unsupported", "contradicted", "not_checkable", "insufficient_source_text"]
+
+Applicability = Literal[
+    "same_variant",                          # source concerns this exact variant (any notation)
+    "same_gene_same_mechanism",              # same gene, other variant, same established mechanism
+    "same_gene_other_variant_or_mechanism",  # same gene but different/unknown mechanism (e.g. neighbouring variant)
+    "same_disease_other_gene",
+    "other_disease_or_population",
+    "not_applicable",                        # general facts (labels, registry status, disease management)
+]
 
 
 class ClaimVerdict(BaseModel):
@@ -240,6 +261,12 @@ class ClaimVerdict(BaseModel):
     ]
     overgeneralization: str = Field(description="Describe wrong transfer from another gene/variant/disease/age group, else ''.")
     abstract_only: bool = Field(description="True if only an abstract/metadata was available for checking.")
+    supporting_quote: str = Field(description="Verbatim passage (<= 400 characters) copied from the provided source text that supports the "
+                                              "verdict; '' only for not_checkable / insufficient_source_text / unsupported.")
+    quote_source_key: str = Field(description="Ledger key of the source the quote was copied from, else ''.")
+    applicability: Applicability = Field(description="How directly the cited evidence applies to THIS patient's variant/mechanism.")
+    intervention_matches: bool = Field(description="True if the source concerns the same intervention/strategy named in the claim "
+                                                   "(always true for claims that name no intervention).")
     rationale: str
     suggested_revision: str = Field(description="Corrected/qualified wording when partially supported; '' otherwise.")
 

@@ -18,8 +18,18 @@ HUMAN_PUBTYPES = {"Case Reports", "Clinical Trial", "Clinical Study", "Clinical 
                   "Clinical Trial, Phase III", "Randomized Controlled Trial", "Observational Study", "Multicenter Study", "Comparative Study"}
 GUIDELINE_SOURCES = {"fda_label", "genereviews"}
 LITERATURE_SOURCES = {"pubmed", "europepmc"}
+# published human treatment reports may be cited from the literature, GeneReviews or an allow-listed journal page
+PRECEDENT_SOURCES = LITERATURE_SOURCES | {"genereviews", "web"}
 HUMAN_PRECEDENT_TYPES = {"direct_human_same_variant", "direct_human_same_gene", "direct_human_same_disease"}
+HUMAN_APPLICABLE = {"same_variant", "same_gene_same_mechanism", "same_disease_other_gene"}
+REASONING_KINDS = {"mechanistic_reasoning", "patient_applicability"}
 OK_VERDICTS = {"supported", "not_checkable"}
+TIER3 = {Section.BESPOKE, Section.REPURPOSING}
+OVERCLAIM = re.compile(r"\b(will|would)\s+(improve|benefit|respond|help|work|be effective)|\bis (effective|beneficial) (for|in) (this|the) patient|"
+                       r"\bproven (to|effective)|\bestablished (benefit|efficacy)|\bcures?\b|\bguarantee", re.I)
+THIS_VARIANT = re.compile(r"\b(this|the patient'?s|the index) variant\b", re.I)
+STRENGTH = ["mechanistic_inference", "preclinical_related", "preclinical_same_gene", "human_related_disease_or_mechanism", "human_same_gene",
+            "human_same_variant", "guideline_or_expert_review", "regulatory_approval"]
 # claim kinds that carry an item's core assertion: trials/contraindications without a supported core claim are dropped
 REQUIRED_KINDS = {
     Section.TRIALS: {"trial_status_or_eligibility"},
@@ -114,7 +124,27 @@ def apply_citation_rules(items: list[ActionItem], ledger: EvidenceLedger) -> Rul
     return res
 
 
-def apply_section_rules(items: list[ActionItem], ledger: EvidenceLedger, age_years: float | None, sex: str) -> RuleResult:
+_GENE_PATTERNS = [
+    re.compile(r"\b([A-Z][A-Z0-9]{1,9})(?:-related|-associated|\s+gene\b|\s+(?:pathogenic\s+)?(?:variants?|mutations?)\b)"),
+    re.compile(r"(?:variants?|mutations?|deficiency|haploinsufficiency)\s+(?:in|of)\s+(?:the\s+)?([A-Z][A-Z0-9]{1,9})\b"),
+]
+_NOT_GENES = {"DNA", "RNA", "MRI", "EEG", "ECG", "IQ", "ALS", "SMA", "DMD", "CNS", "HIV", "COVID", "FDA", "NIH", "US", "EU", "UK", "LOF", "GOF",
+              "ASO", "AAV", "CRISPR", "AND", "OR", "NOT", "DEE", "EE", "HSP", "SCA", "CMT", "HSAN", "MTDNA", "PCR", "WES", "WGS", "ACMG", "VUS"}
+
+
+def trial_named_genes(text: str) -> set[str]:
+    """Gene symbols a trial record explicitly requires/names ('pathogenic variant in X', 'X-related', 'X gene')."""
+    out = set()
+    for pat in _GENE_PATTERNS:
+        for m in pat.finditer(text or ""):
+            g = m.group(1)
+            if g not in _NOT_GENES and any(ch.isdigit() for ch in g) or (g not in _NOT_GENES and len(g) >= 4):
+                out.add(g)
+    return out
+
+
+def apply_section_rules(items: list[ActionItem], ledger: EvidenceLedger, age_years: float | None, sex: str,
+                        genes: list[str] | None = None) -> RuleResult:
     res = RuleResult(items=[])
     for it in items:
         it = it.model_copy(deep=True)
@@ -145,32 +175,24 @@ def apply_section_rules(items: list[ActionItem], ledger: EvidenceLedger, age_yea
             if sex in ("male", "female") and tsex in ("MALE", "FEMALE") and tsex.lower() != sex:
                 res.events.append(RuleEvent(it.item_id, "trial_sex_ineligible", "dropped", f"{nct} sex {tsex}"))
                 continue
+            # genotype eligibility: a trial restricted to named genes must include the patient's gene
+            named = trial_named_genes(f"{rec.title}\n{rec.content}")
+            if genes and named:
+                if not named & {g.upper() for g in genes}:
+                    res.events.append(RuleEvent(it.item_id, "trial_genotype_ineligible", "dropped", f"{nct} names {sorted(named)[:8]}; patient {genes}"))
+                    continue
+                it.criteria_met = list(dict.fromkeys(it.criteria_met + [f"Genetic diagnosis in {', '.join(sorted(named & {g.upper() for g in genes}))} (named in the registry record)"]))
+            if re.search(r"gain[- ]of[- ]function|loss[- ]of[- ]function|dominant[- ]negative|hypomorph", rec.content or "", re.I):
+                it.criteria_unassessable = list(dict.fromkeys(it.criteria_unassessable + [
+                    "The record refers to a variant functional class (gain/loss of function); this variant's class must be confirmed"]))
             if age_years is None:
                 it.criteria_unassessable = list(dict.fromkeys(it.criteria_unassessable + ["Patient age (not stated in case)"]))
             if re.search(r"\b(is|are) eligible\b", it.statement, re.I):
                 res.problem(it.item_id, "Statement asserts definite eligibility; rephrase as 'may qualify' with unassessable criteria.")
-        # ---------------- off-label requires human precedent
-        elif it.section == Section.OFF_LABEL:
-            human = [k for k in cites if _is_human_record(ledger, k)]
-            if not human:
-                it.section = Section.REPURPOSING
-                it.human_precedent = ""
-                res.events.append(RuleEvent(it.item_id, "offlabel_without_human_clinical_record", "moved", "-> drug_repurposing"))
-                res.problem(it.item_id, "Moved to Drug Repurposing: no cited human clinical publication; restate the item as a preclinical/"
-                                        "mechanistic hypothesis and say that no human treatment precedent was identified in the sources searched.")
-            elif not it.human_precedent.strip():
-                res.problem(it.item_id, "Off-label item lacks an explicit 'Human treatment precedent' description.")
-        # ---------------- established targeted requires approval/guideline-level support
-        elif it.section == Section.EXISTING_TARGETED:
-            strong = [k for k in cites if (ledger.get(k) and ledger.get(k).source_type in GUIDELINE_SOURCES)]
-            if it.evidence_level not in ("regulatory_approval", "guideline_or_expert_review") or not strong:
-                human = [k for k in cites if _is_human_record(ledger, k)]
-                target = Section.OFF_LABEL if human else Section.REPURPOSING
-                it.section = target
-                res.events.append(RuleEvent(it.item_id, "targeted_without_approval_or_guideline", "moved", f"-> {target.value}"))
-                res.problem(it.item_id, f"Moved to {target.value}: no label/guideline evidence for an established targeted therapy.")
+        # off-label / existing-targeted placement is decided AFTER verification from verified evidence
+        # (apply_verdicts); no publication-type pre-filter may exclude genuine human treatment reports here.
         # ---------------- bespoke needs a verdict
-        elif it.section == Section.BESPOKE and not it.bespoke_verdict:
+        if it.section == Section.BESPOKE and not it.bespoke_verdict:
             it.bespoke_verdict = "UNCERTAIN"
             res.events.append(RuleEvent(it.item_id, "bespoke_missing_verdict", "set_field", "UNCERTAIN"))
         res.items.append(it)
@@ -183,20 +205,23 @@ def _cites_source(c, ledger: EvidenceLedger, kinds: set[str]) -> bool:
 
 def apply_verdicts(items: list[ActionItem], verdicts: list[ClaimVerdict], *, ledger: EvidenceLedger | None = None,
                    statements_only: bool = False) -> RuleResult:
-    """Apply claim-level verification results — FAIL CLOSED.
+    """Apply claim-level verification results — FAIL CLOSED, while preserving verified lower-tier evidence.
 
-    * A claim without a decision is unverified and removed; an item whose full statement has no decision is
-      marked `unverified` and can never be rendered.
-    * supported / not_checkable claims are kept; partially supported claims are kept for traceability but do
-      not count as support, and the verifier's suggested wording is NOT applied (it is passed to the revision
-      step and must be re-verified).
-    * Evidence-based tier gate (needs `ledger`): Off-label requires a SUPPORTED human-treatment claim with a
-      direct_human_* evidence type citing a literature record; Existing Targeted requires a SUPPORTED
-      regulatory/treatment claim citing a label or GeneReviews. Items failing the gate are moved down a tier
-      when supported lower-tier evidence remains (e.g., preclinical -> Drug Repurposing) — never silently lost —
-      and their statements must be rewritten and re-verified.
-    * With `statements_only`, claim decisions are taken as previously established (only the -1 statement
-      verdict is new) — used after a revision that changed only the statement."""
+    Claim decisions
+      supported            -> verified (factual) evidence
+      not_checkable        -> accepted ONLY for explicit reasoning kinds (mechanistic_reasoning, patient_applicability);
+                              a factual claim that "cannot be checked" is not evidence and is removed
+      partially_supported  -> kept for traceability, does not count as support; wording goes to revision (never auto-applied)
+      insufficient_source_text -> removed, recorded as NOT ASSESSABLE (e.g. table/full text inaccessible) — not as false
+      unsupported/contradicted -> removed
+      no decision          -> removed (unverified)
+    An item needs at least one SUPPORTED factual claim. The full statement must be supported (Tier 1/2); in Tier 3 a
+    not_checkable statement is accepted as an explicit hypothesis on top of verified premises.
+    Tier gate (with `ledger`): Off-label needs a supported human-treatment claim (direct_human_* evidence, applicable to
+    this patient's variant/gene/disease, same intervention, citing a published report); Existing Targeted needs a
+    supported label/guideline claim for the same intervention. Failing items move to the tier their verified evidence
+    supports and must be rewritten + re-verified. The evidence level shown in the report is derived from verified
+    evidence, not from the researcher's own label."""
     by_item: dict[str, dict[int, ClaimVerdict]] = {}
     for v in verdicts:
         by_item.setdefault(v.item_id, {})[v.claim_index] = v
@@ -216,6 +241,16 @@ def apply_verdicts(items: list[ActionItem], verdicts: list[ClaimVerdict], *, led
                 res.events.append(RuleEvent(it.item_id, "claim_unverified", "removed_claim", c.text[:160]))
                 res.problem(it.item_id, f"Claim could not be verified (no decision): '{c.text[:160]}'.")
                 continue
+            if v.verdict == "not_checkable" and c.kind not in REASONING_KINDS:
+                res.events.append(RuleEvent(it.item_id, "factual_claim_not_checkable", "removed_claim", c.text[:160]))
+                res.problem(it.item_id, f"Factual claim could not be checked against any source: '{c.text[:160]}'. Cite a retrieved source or drop it.")
+                continue
+            if (v.verdict == "supported" and c.kind == "molecular_fact" and THIS_VARIANT.search(c.text)
+                    and v.applicability == "same_gene_other_variant_or_mechanism"):
+                res.events.append(RuleEvent(it.item_id, "variant_mechanism_transfer", "removed_claim", c.text[:160]))
+                res.problem(it.item_id, f"Claim about THIS variant is supported only for a different variant/mechanism: '{c.text[:160]}'. "
+                                        "State it as evidence about the other variant, not about the patient's variant.")
+                continue
             if v.verdict in OK_VERDICTS:
                 kept.append(c)
                 kept_v.append(v)
@@ -224,6 +259,10 @@ def apply_verdicts(items: list[ActionItem], verdicts: list[ClaimVerdict], *, led
                 kept_v.append(v)
                 hint = f" Verifier-suggested wording (unverified, must be re-checked): '{v.suggested_revision[:200]}'" if v.suggested_revision.strip() else ""
                 res.problem(it.item_id, f"Claim only partially supported: '{c.text[:160]}' — {v.rationale[:200]}.{hint}")
+            elif v.verdict == "insufficient_source_text":
+                res.events.append(RuleEvent(it.item_id, "claim_not_assessable", "removed_claim", f"{c.text[:160]} | {v.rationale[:200]}"))
+                res.problem(it.item_id, f"Evidence for '{c.text[:160]}' could not be assessed from the accessible text (not shown to be false). "
+                                        "Retrieve the full text/table passage, or restate the item using only verifiable claims.")
             else:
                 res.events.append(RuleEvent(it.item_id, f"claim_{v.verdict}", "removed_claim", f"{c.text[:160]} | {v.rationale[:200]}"))
                 res.problem(it.item_id, f"Claim {v.verdict}: '{c.text[:160]}' — {v.rationale[:200]}. Remove or correct it in the statement.")
@@ -236,16 +275,29 @@ def apply_verdicts(items: list[ActionItem], verdicts: list[ClaimVerdict], *, led
         if sv is None:
             res.events.append(RuleEvent(it.item_id, "statement_unverified", "flagged", "no decision for the full statement"))
             res.problem(it.item_id, "Full statement could not be verified (no decision); it cannot be rendered unless re-verified.")
+        elif sv.verdict == "not_checkable":
+            if it.section in TIER3:
+                status = "hypothesis"
+            else:
+                status = "needs_reverification"
+                res.problem(it.item_id, "Tier 1/2 statement could not be checked against sources; rewrite it to state only cited facts.")
         elif sv.verdict == "partially_supported":
             hint = f" Verifier-suggested wording (unverified): '{sv.suggested_revision[:300]}'" if sv.suggested_revision.strip() else ""
             res.problem(it.item_id, f"Full statement partially supported: {sv.rationale[:250]}. Rewrite it to say only what the cited sources support.{hint}")
+        elif sv.verdict == "insufficient_source_text":
+            res.problem(it.item_id, f"Full statement could not be assessed from accessible text: {sv.rationale[:250]}. Restate it from verifiable claims.")
         elif sv.verdict in ("unsupported", "contradicted"):
             res.problem(it.item_id, f"Full statement {sv.verdict}: {sv.rationale[:250]}. Rewrite it to say only what the cited sources support.")
         if sv is not None and sv.overgeneralization.strip():
             res.problem(it.item_id, f"Overgeneralisation in statement: {sv.overgeneralization[:200]}")
+        if it.section != Section.TRIALS and OVERCLAIM.search(it.statement + " " + it.human_precedent):
+            status = "needs_reverification" if status in ("supported", "hypothesis") else status
+            res.problem(it.item_id, "Statement predicts benefit for this patient or overstates certainty; report only what the evidence shows "
+                                    "(a response in a published individual does not show that this patient will respond).")
         ok = [(c, v) for c, v in zip(kept, kept_v) if v is None or v.verdict in OK_VERDICTS]
-        if not ok:
-            res.events.append(RuleEvent(it.item_id, "no_supported_claims", "dropped", ""))
+        factual = [(c, v) for c, v in ok if c.kind not in REASONING_KINDS and (v is None or v.verdict == "supported")]
+        if not factual:
+            res.events.append(RuleEvent(it.item_id, "no_verified_factual_claim", "dropped", "only reasoning or unverified claims remain"))
             continue
         req = REQUIRED_KINDS.get(it.section, set())
         if req and not any(c.kind in req for c, _ in ok):
@@ -255,7 +307,8 @@ def apply_verdicts(items: list[ActionItem], verdicts: list[ClaimVerdict], *, led
         if ledger is not None and not statements_only:
             def human_precedent() -> bool:
                 return any(c.kind == "treatment_effect_human" and v is not None and v.verdict == "supported"
-                           and v.evidence_type in HUMAN_PRECEDENT_TYPES and _cites_source(c, ledger, LITERATURE_SOURCES) for c, v in ok)
+                           and v.evidence_type in HUMAN_PRECEDENT_TYPES and v.applicability in HUMAN_APPLICABLE and v.intervention_matches
+                           and _cites_source(c, ledger, PRECEDENT_SOURCES) for c, v in ok)
 
             def demote(target: Section, rule: str, why: str) -> None:
                 nonlocal status
@@ -268,21 +321,69 @@ def apply_verdicts(items: list[ActionItem], verdicts: list[ClaimVerdict], *, led
 
             if it.section == Section.EXISTING_TARGETED:
                 strong = any(c.kind in ("regulatory_status", "treatment_effect_human") and v is not None and v.verdict == "supported"
-                             and _cites_source(c, ledger, GUIDELINE_SOURCES) for c, v in ok)
+                             and v.intervention_matches and _cites_source(c, ledger, GUIDELINE_SOURCES) for c, v in ok)
                 if not strong:
                     demote(Section.OFF_LABEL if human_precedent() else Section.REPURPOSING, "targeted_without_verified_label_or_guideline",
-                           "no verified label/guideline support for this indication.")
+                           "no verified label/guideline support for this intervention and indication.")
             if it.section == Section.OFF_LABEL and not human_precedent():
                 demote(Section.REPURPOSING, "offlabel_without_verified_human_precedent",
-                       "no verified human treatment precedent in the same gene/disease/variant context.")
+                       "no verified human treatment precedent for this intervention in the same gene/disease/variant context.")
             if it.section == Section.REPURPOSING and human_precedent():
                 res.problem(it.item_id, "Verified human treatment precedent in this context: consider moving to Off-label (Tier 2).")
+            derived = derive_evidence_level(it, ok, ledger)
+            if derived != it.evidence_level:
+                res.events.append(RuleEvent(it.item_id, "evidence_level_derived", "set_field", f"{it.evidence_level} -> {derived}"))
+                it.evidence_level = derived  # type: ignore[assignment]
         res.statement_status[it.item_id] = status
         res.reindexed += [v.model_copy(update={"claim_index": j}) for j, v in enumerate(kept_v) if v is not None]
         if sv is not None:
             res.reindexed.append(sv)
         res.items.append(it)
     return res
+
+
+def derive_evidence_level(it: ActionItem, ok: list, ledger: EvidenceLedger) -> str:
+    """Strongest evidence level actually VERIFIED for the item (shown in the report)."""
+    if it.section == Section.TRIALS:
+        return "trial_registry_record"
+    best = "mechanistic_inference"
+
+    def up(level: str) -> None:
+        nonlocal best
+        if STRENGTH.index(level) > STRENGTH.index(best):
+            best = level
+
+    for c, v in ok:
+        if v is None or v.verdict != "supported":
+            continue
+        if c.kind == "regulatory_status" and _cites_source(c, ledger, {"fda_label"}) and v.intervention_matches:
+            up("regulatory_approval")
+        elif _cites_source(c, ledger, {"genereviews"}) and c.kind in ("treatment_effect_human", "safety_or_contraindication", "disease_fact"):
+            up("guideline_or_expert_review")
+        elif c.kind == "treatment_effect_human" and v.evidence_type in HUMAN_PRECEDENT_TYPES and v.intervention_matches:
+            up("human_same_variant" if v.applicability == "same_variant" else
+               "human_same_gene" if v.applicability in ("same_gene_same_mechanism", "same_gene_other_variant_or_mechanism") else
+               "human_related_disease_or_mechanism")
+        elif c.kind == "treatment_effect_preclinical" or v.evidence_type == "preclinical":
+            up("preclinical_same_gene" if v.applicability in ("same_variant", "same_gene_same_mechanism", "same_gene_other_variant_or_mechanism")
+               else "preclinical_related")
+    if it.section == Section.SUPPORTIVE and best == "mechanistic_inference":
+        best = "human_related_disease_or_mechanism"  # supported standard-of-care facts without guideline source
+    return best
+
+
+def compose_from_verified_claims(it: ActionItem, verdicts: list[ClaimVerdict]) -> ActionItem | None:
+    """Last-resort salvage: rebuild a statement ONLY from claims that were individually verified as supported
+    (verbatim claim texts + their citations). Used when no supportable free-text wording was found."""
+    vs = {v.claim_index: v for v in verdicts if v.item_id == it.item_id}
+    parts = []
+    for i, c in enumerate(it.claims):
+        v = vs.get(i)
+        if v is not None and v.verdict == "supported" and c.kind not in REASONING_KINDS and c.citations:
+            parts.append(c.text.rstrip(". ") + " " + " ".join(f"[{k}]" for k in c.citations) + ".")
+    if not parts:
+        return None
+    return it.model_copy(update={"statement": " ".join(parts), "conditional_action": "", "human_precedent": "" if it.section != Section.OFF_LABEL else it.human_precedent})
 
 
 def _norm_title(t: str) -> set[str]:

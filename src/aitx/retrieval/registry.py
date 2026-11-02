@@ -36,6 +36,8 @@ TOOL_SPECS: list[dict[str, Any]] = [
      "input_schema": _obj({"query": S, "max_results": I, "page": I})},
     {"name": "europepmc_fulltext_excerpts", "description": "Open-access full text paragraphs from a PMC article that match keywords (e.g. dose, outcome, adverse). Use to verify human treatment precedent details.",
      "input_schema": _obj({"pmcid": S, "keywords": LS})},
+    {"name": "variant_literature_search", "description": "Find articles that mention the patient's EXACT variant in any common notation (e.g. p.Arg123Trp, R123W, c.367C>T, rsID), searching Europe PMC full text (incl. tables of open-access papers) and PubMed titles/abstracts. A hit is not evidence that a reported individual's treatment response applies to this patient.",
+     "input_schema": _obj({"gene": S, "notations": LS, "extra_terms": LS})},
     {"name": "clinvar_lookup", "description": "ClinVar records for a variant (gene + cDNA HGVS + transcript) or, with empty hgvs_c, pathogenic variants in the gene.",
      "input_schema": _obj({"gene": S, "hgvs_c": S, "transcript": S})},
     {"name": "search_trials", "description": "ClinicalTrials.gov API v2 search (live). open_only=true restricts to RECRUITING, NOT_YET_RECRUITING, ENROLLING_BY_INVITATION and AVAILABLE expanded access. Search by condition, free-text term (gene), and/or intervention.",
@@ -69,6 +71,7 @@ class ToolBox:
             "pubmed_fetch_abstracts": lambda pmids: ncbi.pubmed_fetch_abstracts(http, ledger, pmids),
             "europepmc_search": lambda query, max_results, page: europepmc.europepmc_search(http, ledger, query, max_results or 20, page or 1),
             "europepmc_fulltext_excerpts": lambda pmcid, keywords: europepmc.europepmc_fulltext_excerpts(http, ledger, pmcid, keywords),
+            "variant_literature_search": lambda gene, notations, extra_terms: europepmc.variant_literature_search(http, ledger, gene, notations, extra_terms or None),
             "clinvar_lookup": lambda gene, hgvs_c, transcript: ncbi.clinvar_lookup(http, ledger, gene, hgvs_c, transcript),
             "search_trials": lambda condition, term, intervention, open_only, page_token: clinicaltrials.search_trials(
                 http, ledger, condition, term, intervention, open_only, page_token=page_token),

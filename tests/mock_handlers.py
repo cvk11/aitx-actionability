@@ -37,7 +37,7 @@ def established(ctx):
     tb = ctx["toolbox"]
     tb.execute("genereviews_read", {"chapter": "genex", "sections": []})
     tb.execute("fda_label_search", {"drug": "drug Q", "indication_text": "", "sections": []})
-    return SectionResearchOutput(items=[
+    return SectionResearchOutput(candidate_handoffs=[], items=[
         item("sup-seizures", "supportive_management", "Seizures", f"Treat seizures with standard anti-seizure medications [{GR_TX}].",
              [("Seizures are treated with standard ASMs.", [GR_TX], "disease_fact"), ("ASM X is first line.", [GR_TX], "treatment_effect_human")]),
         item("ci-drugz", "contraindications_precautions", "Drug Z", f"Avoid drug Z [{GR_AVOID}].", [("Drug Z worsened seizures.", [GR_AVOID], "safety_or_contraindication")]),
@@ -49,7 +49,7 @@ def established(ctx):
 def emerging(ctx):
     tb = ctx["toolbox"]
     tb.execute("pubmed_fetch_abstracts", {"pmids": ["11111111", "22222222"]})
-    return SectionResearchOutput(items=[
+    return SectionResearchOutput(candidate_handoffs=[], items=[
         item("trial-open", "clinical_trial_eligibility", "Drug Q trial", "The patient may qualify (genetic DEE, age 5) [NCT00000001].",
              [("NCT00000001 is recruiting children 2-17 years.", ["NCT00000001"], "trial_status_or_eligibility")], level="trial_registry_record",
              nct_id="NCT00000001", criteria_met=["age 2-17"], criteria_unassessable=["seizure frequency"]),
@@ -61,7 +61,7 @@ def emerging(ctx):
 
 
 def hypothesized(ctx):
-    return SectionResearchOutput(items=[
+    return SectionResearchOutput(candidate_handoffs=[], items=[
         item("aso-allele", "bespoke_therapies", "Allele-selective ASO", "Allele-selective knockdown is uncertain [COMPUTED:GENEX:c.100G>A].",
              [("The variant is missense in exon 2.", ["COMPUTED:GENEX:c.100G>A"], "molecular_fact")], level="mechanistic_inference", bespoke_verdict="UNCERTAIN"),
         item("fake-cite", "drug_repurposing", "Compound F", "Compound F works [PMID:99999999].",
@@ -79,9 +79,29 @@ def verify(ctx):
         verdict = "supported"
         if c["item_id"] == "sup-seizures" and c["claim_index"] == 1:
             verdict = "unsupported"
+        key, quote = quote_from_packet(ctx["system"], c)
+        if not c["citations"] and verdict == "supported":
+            verdict = "not_checkable"
         out.append(ClaimVerdict(item_id=c["item_id"], claim_index=c["claim_index"], verdict=verdict, evidence_type="direct_human_same_gene",
-                                overgeneralization="", abstract_only=False, rationale="mock", suggested_revision=""))
+                                overgeneralization="", abstract_only=False, supporting_quote=quote, quote_source_key=key,
+                                applicability="same_gene_same_mechanism", intervention_matches=True, rationale="mock", suggested_revision=""))
     return VerificationBatch(verdicts=out)
+
+
+def quote_from_packet(system: str, claim: dict) -> tuple[str, str]:
+    """Copy a real passage fragment from the evidence packet shown for this claim (like a faithful verifier)."""
+    import re
+
+    m = re.search(rf"##### Evidence for item_id={re.escape(claim['item_id'])} claim_index={claim['claim_index']}\n(.*?)(?=\n##### Evidence for|\Z)",
+                  system, re.S)
+    if not m:
+        return "", ""
+    for block in re.split(r"\n(?==== \[)", m.group(1)):
+        km = re.match(r"=== \[([^\]]+)\]", block)
+        pm = re.search(r"\n\[[^\]]+\] (.{20,})", block)
+        if km and pm:
+            return km.group(1), pm.group(1)[:60]
+    return "", ""
 
 
 def revise(ctx):
@@ -119,7 +139,7 @@ HANDLERS = {
 
 def baseline(ctx):
     a, b = established(ctx), emerging(ctx)
-    return SectionResearchOutput(items=a.items + b.items, searched_but_not_found=[], open_questions=[])
+    return SectionResearchOutput(candidate_handoffs=[], items=a.items + b.items, searched_but_not_found=[], open_questions=[])
 
 
 HANDLERS_BASELINE = {"A_baseline": baseline, "F_synthesize": synthesize}

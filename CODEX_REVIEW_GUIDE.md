@@ -2,6 +2,9 @@
 
 Goal: find defects that could produce **incorrect or misleading clinical statements**, untraceable citations, rule violations, or privacy/security problems. Prioritise correctness of evidence handling over style. Read `AGENTS.md` first (no paid API calls, no hardcoding).
 
+## 0b. Re-review of the second remediation (commit after `36d8d3e`)
+Read `SCIENTIFIC_REMEDIATION_REPORT.md`. Priorities: (a) can a factual claim reach the report without a supported verdict whose quote is found in a cited source (`verifier.ground_verdict`, `rules.apply_verdicts`, `compose_from_verified_claims`)? (b) can evidence about another variant/gene/intervention be labelled as precedent for this patient? (c) are valid candidates lost anywhere (handoffs, salvage, tier moves)? (d) passage selection (`evidence.select_passages`) for very long sources and tables.
+
 ## 0. Targeted re-review of the remediation (commit after `9be0d2c`)
 Read `REMEDIATION_REPORT.md`. For each B1–B9 row, check the named functions and the regression test in `tests/test_audit_regressions.py`. Priorities: (a) can any path render an item whose full statement lacks a `supported`/`not_checkable` decision (`pipeline.py` final gate, `_verify`, exception branch)? (b) can synthesis text bypass `verify_synthesis`? (c) is `CostTracker.reserve` used before every model request, including Gemini and retries? (d) is `assemble_submission` the only writer of `outputs/aitx_submission.json`? (e) ClinVar SPDI/VCF normalisation (`_trim`) for indels in repeats, MNVs and dups.
 

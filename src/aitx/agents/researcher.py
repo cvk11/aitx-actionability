@@ -48,6 +48,28 @@ def run_researchers(ctx: CaseContext, llm: Any, toolbox: ToolBox, max_rounds: in
     return results
 
 
+def unique_id(base: str, seen: set[str]) -> str:
+    """Deterministic globally unique item id (base, base-2, base-3, ...)."""
+    base = (base or "item").strip() or "item"
+    cand, n = base, 2
+    while cand in seen:
+        cand, n = f"{base}-{n}", n + 1
+    seen.add(cand)
+    return cand
+
+
+def collect_handoffs(outputs: dict[str, SectionResearchOutput]) -> list[dict[str, Any]]:
+    out = []
+    for stage, o in outputs.items():
+        for n, h in enumerate(getattr(o, "candidate_handoffs", []) or [], start=1):
+            from ..schemas import CandidateHandoff
+
+            h = h if isinstance(h, CandidateHandoff) else CandidateHandoff.model_validate(h)
+            out.append({"handoff_id": f"{stage}-h{n}", "from_stage": stage, "intervention": h.intervention,
+                        "proposed_section": h.proposed_section.value, "reason": h.reason, "citations": h.citations})
+    return out
+
+
 def merge_items(outputs: dict[str, SectionResearchOutput]) -> tuple[list[ActionItem], dict[Section, list[str]], list[str]]:
     items: list[ActionItem] = []
     seen: set[str] = set()
@@ -56,10 +78,7 @@ def merge_items(outputs: dict[str, SectionResearchOutput]) -> tuple[list[ActionI
     for stage, out in outputs.items():
         _, owned = RESEARCHERS.get(stage, ("", tuple(Section)))
         for it in out.items:
-            iid = it.item_id.strip() or f"{stage}-{len(items)}"
-            if iid in seen:
-                iid = f"{stage}-{iid}"
-            seen.add(iid)
+            iid = unique_id(it.item_id.strip() or f"{stage}-item", seen)
             items.append(it.model_copy(update={"item_id": iid}))
         # negative findings are attached to the first owned section they mention, else to all owned sections' notes
         for neg in out.searched_but_not_found:

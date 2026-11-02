@@ -53,7 +53,9 @@ def test_agent_loop_executes_tools_and_parses(settings, fake_http):
     ]
     fc = FakeClient(script)
     cost = CostTracker()
-    llm = ClaudeLLM(settings, cost, client=fc)
+    from dataclasses import replace
+
+    llm = ClaudeLLM(replace(settings, refusal_fallback=True), cost, client=fc)
     L = EvidenceLedger()
     out = llm.agent(stage="x", system="sys", user="u", output_model=JudgeReport, toolbox=ToolBox(fake_http, L, settings), tool_names=None, max_rounds=3)
     assert out.scores[0].score_1_to_5 == 3
@@ -91,3 +93,11 @@ def test_fallback_served_model_recorded(settings):
     cost = CostTracker()
     ClaudeLLM(settings, cost, client=fc).structured(stage="s", system="s", user="u", output_model=JudgeReport)
     assert cost.calls[0].fallback_used and cost.calls[0].served_model == "claude-opus-5"
+
+
+def test_fallback_disabled_by_default(settings):
+    """First controlled run: no automatic model fallback unless explicitly enabled."""
+    assert settings.refusal_fallback is False
+    fc = FakeClient([msg([NS(type="text", text=FINAL)], "end_turn")])
+    ClaudeLLM(settings, CostTracker(), client=fc).structured(stage="s", system="s", user="u", output_model=JudgeReport)
+    assert "fallbacks" not in fc.calls[0] and "betas" not in fc.calls[0]
