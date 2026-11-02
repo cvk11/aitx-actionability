@@ -168,9 +168,20 @@ class GeminiLLM:
             if bill > upper + 1e-9:
                 raise StructuredOutputError(f'{stage}: actual usage exceeded reserved estimate')
             candidates = getattr(resp, 'candidates', None) or []
-            if len(candidates) != 1 or candidates[0].finish_reason != types.FinishReason.STOP or not candidates[0].content:
-                raise StructuredOutputError(f'{stage}: missing, blocked, truncated or incomplete Gemini response')
-            return candidates[0].content
+            content = candidates[0].content if len(candidates) == 1 else None
+            finish = candidates[0].finish_reason if len(candidates) == 1 else None
+            if len(candidates) != 1 or finish != types.FinishReason.STOP or not content:
+                # A transiently empty, blocked or truncated turn (e.g. MAX_TOKENS mid-tool-loop, as seen at
+                # E_followup:r9 in the third real paid run) is retried like a provider error: the sent
+                # conversation is unchanged, so nothing is lost, and this attempt's billing is already
+                # settled. Fail closed only after the bounded attempt budget.
+                if attempt + 1 < self.settings.max_attempts:
+                    time.sleep(min(8, 2 ** attempt))
+                    continue
+                raise StructuredOutputError(
+                    f'{stage}: missing, blocked, truncated or incomplete Gemini response '
+                    f'(candidates={len(candidates)}, finish_reason={finish})') from None
+            return content
         raise StructuredOutputError(f'{stage}: retry budget exhausted')
 
     @staticmethod

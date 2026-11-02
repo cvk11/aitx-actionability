@@ -228,6 +228,15 @@ class Supervisor:
                     cost = 0.0
                 self.spent += cost
                 entry["run_cost_usd"] = round(cost, 4)
+                # keep the full audit/ledger/report of every attempt on disk — a failed run's evidence
+                # must survive for diagnosis even when the cycle is reverted or rejected
+                try:
+                    from aitx.pipeline import save_audit
+
+                    p = save_audit(res, self.root / "outputs" / "internal")
+                    entry["artifacts"] = str(p)
+                except Exception as e:
+                    entry["artifact_save_error"] = f"{type(e).__name__}: {e}"
             entry["spent_usd"] = round(self.spent, 4)
             blockers = getattr(res, "blockers", None) if res is not None else None
             entry["blockers"] = blockers
@@ -273,6 +282,7 @@ class Supervisor:
             if not self.run_suite():
                 self._git.revert(touched)
                 entry["outcome"] = "reverted_after_test_failure"
+                entry["suite_output_tail"] = getattr(self, "last_suite_output", "")[-800:]
                 self.cycles.append(entry)
                 report["outcome"] = "reverted_after_test_failure"
                 return report

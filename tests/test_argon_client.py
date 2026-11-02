@@ -54,15 +54,28 @@ def test_structured_billing_and_no_hidden_calls(settings):
     assert cost.reserved_usd==0
 
 
-@pytest.mark.parametrize('bad', [response(finish='MAX_TOKENS'),response(finish='CONTINUATION'),
-    response(finish='SAFETY'),response(model='gemini-3.8-flash'),response(text='PATIENT_SECRET'),
-    response(parts=[types.Part(text='{"result":"ok"}'),types.Part(function_call=types.FunctionCall(name='unrequested',args={}))])])
-def test_incomplete_or_wrong_provider_output_fails_closed(settings,bad):
-    llm,client,cost=invoke(settings,[bad])
+@pytest.mark.parametrize('bad,n_calls,msg_part', [
+    (response(finish='MAX_TOKENS'), 3, 'incomplete Gemini response'),
+    (response(finish='CONTINUATION'), 3, 'incomplete Gemini response'),
+    (response(finish='SAFETY'), 3, 'incomplete Gemini response'),
+    (response(model='gemini-3.8-flash'), 1, 'unrecognized served model'),
+    (response(text='PATIENT_SECRET'), 1, 'invalid structured Gemini output'),
+    (response(parts=[types.Part(text='{"result":"ok"}'),
+                     types.Part(function_call=types.FunctionCall(name='unrequested', args={}))]), 1, 'unexpected tool call'),
+])
+def test_incomplete_or_wrong_provider_output_fails_closed(settings, monkeypatch, bad, n_calls, msg_part):
+    # Incomplete/truncated/blocked candidate turns are transient in long tool loops (third real paid run,
+    # E_followup:r9): they retry within the bounded attempt budget — each attempt settling its own
+    # accounting — and only fail closed after the budget. Provider/model mismatches, parse failures and
+    # unexpected tool calls still fail immediately.
+    monkeypatch.setattr('aitx.llm.gemini_client.time.sleep', lambda _: None)
+    llm, client, cost = invoke(settings, [bad, bad, bad])
     with pytest.raises(StructuredOutputError) as e:
-        llm.structured(stage='x',system='s',user='u',output_model=Answer)
+        llm.structured(stage='x', system='s', user='u', output_model=Answer)
     assert 'PATIENT_SECRET' not in str(e.value)
-    assert len(client.calls)==1 and cost.reserved_usd==0
+    assert len(client.calls) == n_calls
+    assert msg_part in str(e.value)
+    assert cost.reserved_usd == 0
 
 
 @pytest.mark.parametrize('bad', [response(usage=None), None])
