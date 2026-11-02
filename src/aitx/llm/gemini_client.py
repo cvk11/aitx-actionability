@@ -50,7 +50,7 @@ class GeminiLLM:
         if level not in {'low', 'medium', 'high'}:
             raise ValueError('Argon thinking level must be low, medium or high')
         kw = dict(system_instruction=system, max_output_tokens=self.settings.max_tokens,
-                  thinking_config=types.ThinkingConfig(thinking_level=level), store=False,
+                  thinking_config=types.ThinkingConfig(thinking_level=level), store=False, service_tier=types.ServiceTier.STANDARD,
                   automatic_continuation=False,
                   automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
         if specs:
