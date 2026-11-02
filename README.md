@@ -2,16 +2,16 @@
 
 Evidence-grounded agentic system that turns a confirmed rare-disease genotype + brief clinical context into a **therapeutic actionability report** in the official format of the SAIL AI-Tx Challenge (final task, Tier 3).
 
-> **Status (2026-11-02, milestone 1 + audit remediation):** implementation complete and tested offline; live biomedical retrieval verified against public APIs; **no paid LLM inference has been run yet**, so no genuine reports exist and `outputs/aitx_submission.json` has not been created. Hypothetical patients only — not for clinical use.
+> **Status (2026-11-02, Argon migration branch):** provider implementation tested offline; historical live biomedical tests are listed below, but are not evidence of live Argon compatibility; **no paid LLM inference has been run yet**, so no genuine reports exist and `outputs/aitx_submission.json` has not been created. Hypothetical patients only — not for clinical use.
 
 ## What is verified vs. not
 
 | Category | Meaning | Result |
 |---|---|---|
-| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, audit-regression tests (first audit B1–B9, second audit S1–S10 + residual R1–R9, ITPR1 regression examples, retrieval-failure remediation, scientific-readiness R1–R6), Claude-only policy | 163 passed |
+| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, audit-regression tests (first audit B1–B9, second audit S1–S10 + residual R1–R9, ITPR1 regression examples, retrieval-failure remediation, scientific-readiness R1–R6), Argon-only active factory | see ARGON_MIGRATION.md and test report |
 | Live retrieval tests (`pytest -m live`) | Free public APIs (PubMed, CT.gov, ClinVar, FDA labels, Europe PMC, VV/VEP) on the public CFTR example + ITPR1 evidence-retrieval, therapeutic-coverage and coverage-completeness regressions | 7 passed |
 | Deterministic scientific checks (`scripts/scientific_checks.py`) | HGVS/transcript/exon/NMD/ClinVar/ClinGen/GeneReviews/trials on the 4 official cases + CFTR control | see `docs/SCIENTIFIC_CHECKS.md` |
-| Genuine LLM clinical inference | Claude research, interpretation, verification | **not run** (requires authorization + `ANTHROPIC_API_KEY`) |
+| Genuine LLM clinical inference | Argon research, interpretation, verification | **not run** (requires authorization + `GEMINI_API_KEY`) |
 
 Passing software tests does not establish scientific or clinical validity.
 
@@ -46,7 +46,7 @@ Build the GeneReviews snapshot (official NCBI archive, ~640 MB streamed, ~1 min;
 ```bash
 python scripts/build_genereviews_index.py
 ```
-Configuration: copy `.env.example` to `.env` and fill `ANTHROPIC_API_KEY` locally (never commit `.env`; never paste keys into chats or issues). Optional free `NCBI_API_KEY`/`NCBI_EMAIL` raise NCBI rate limits. No other model-provider key is used.
+Configuration: copy `.env.example` to `.env` and fill `GEMINI_API_KEY` locally (never commit `.env`; never paste keys into chats or issues). Optional free `NCBI_API_KEY`/`NCBI_EMAIL` raise NCBI rate limits. No other model-provider key is used.
 
 ## Usage
 Offline tests (no network, no cost):
@@ -91,7 +91,7 @@ Key properties: models cite only evidence-ledger keys retrieved in the same run;
 ```
 src/aitx/            config, schemas, template, http, ledger, variant_model, clinical, rules, render, qc, pipeline, factory, robustness
 src/aitx/retrieval/  ncbi, clinicaltrials, variant, drugs, europepmc, genereviews, web, registry (tool specs)
-src/aitx/llm/        anthropic_client (Claude), mock, base (cost/budget); gemini_client is archived and unused
+src/aitx/llm/        gemini_client (active Argon), mock, base; anthropic_client is legacy and never built by the runtime factory
 src/aitx/agents/     interpreter (A), researcher (B/C), verifier (D), reviewer (E), synthesizer (F), context
 prompts/             version-controlled templates (SHA-256 recorded per run)
 data/official*/      verbatim official template and cases + SHA-256 provenance
@@ -102,10 +102,10 @@ tests/               offline unit/integration/endpoint tests + live smoke tests
 ```
 
 ## Models
-Claude Opus only: `claude-opus-5-5` for research, interpretation, verification and synthesis (exact identifier; aliases such as "latest" are rejected by config). Gemini is not used (project decision 2026-11-02; no Gemini key is read). Arm C (independent OpenAI research) is a placeholder only.
+`gemini-4-argon` is the sole active inference provider. Research, interpretation, verification and synthesis all use it. No Anthropic fallback or key is used. See [ARGON_MIGRATION.md](ARGON_MIGRATION.md) for API contract, migration base, offline evidence and live-validation limitations. Arm C remains an unimplemented placeholder.
 
-## Cost (estimate, not a measurement)
-`python scripts/estimate_cost.py` — with `AITX_MAX_TOOL_ROUNDS=16`: expected ≈ $5.5, worst case under the model's assumptions ≈ $7.5 per patient (Claude Opus 5.5 at $4/$20 per MTok; includes fail-closed re-verification and synthesis verification). Application-level guard `AITX_MAX_COST_USD_PER_CASE=12` (atomic per-request reservations, see `COST_AND_LIMITATIONS.md`); it is **not** a provider-enforced cap — also set a spend limit in the Anthropic Console.
+## Cost (illustrative, not measured)
+`python scripts/estimate_cost.py` prints explicit token scenarios with current Argon pricing. Thinking tokens are billed as output; the date-based price change is included. The $12 per-case application reservation guard is not a provider-enforced spending cap. No real Argon inference has been run.
 
 ## Privacy and security
 Secret scan (2026-11-02, all tracked files and every commit in history): no Anthropic/OpenAI/Google/GitHub/Hugging Face/AWS/Slack token patterns, no private keys, no hardcoded credential assignments; `.env` absent and git-ignored; caches, GeneReviews archive and internal outputs not tracked. Procedure in `CODEX_REVIEW_GUIDE.md` §9. In deployment mode (forced on a Space), no disk cache, no artifacts, no input/output logging; Gradio analytics, run history, monitoring and flagging are disabled.

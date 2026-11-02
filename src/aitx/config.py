@@ -58,12 +58,12 @@ FORBIDDEN_MODEL_SUBSTRINGS = ("latest",)
 
 @dataclass(frozen=True)
 class Settings:
-    primary_model: str = field(default_factory=lambda: _str("AITX_PRIMARY_MODEL", "claude-opus-5-5"))
-    verifier_model: str = field(default_factory=lambda: _str("AITX_VERIFIER_MODEL", "claude-opus-5-5"))
+    primary_model: str = field(default_factory=lambda: _str("AITX_PRIMARY_MODEL", "gemini-4-argon"))
+    verifier_model: str = field(default_factory=lambda: _str("AITX_VERIFIER_MODEL", "gemini-4-argon"))
     gemini_model: str = field(default_factory=lambda: _str("AITX_GEMINI_MODEL", "gemini-4-argon"))
     effort: str = field(default_factory=lambda: _str("AITX_EFFORT", "high"))
     verifier_effort: str = field(default_factory=lambda: _str("AITX_VERIFIER_EFFORT", "medium"))
-    enable_gemini: bool = False  # archived: Gemini is not used by any pipeline configuration (project decision 2026-11-02)
+    enable_gemini: bool = True  # sole active provider
     # off by default: a fallback could serve a turn with another model; enable only when that is acceptable and accounted for
     refusal_fallback: bool = field(default_factory=lambda: _bool("AITX_REFUSAL_FALLBACK", False))
     max_tool_rounds: int = field(default_factory=lambda: _int("AITX_MAX_TOOL_ROUNDS", 24))
@@ -74,7 +74,7 @@ class Settings:
     gemini_price_in: float = field(default_factory=lambda: _float("AITX_GEMINI_PRICE_IN_PER_MTOK", -1.0))
     gemini_price_out: float = field(default_factory=lambda: _float("AITX_GEMINI_PRICE_OUT_PER_MTOK", -1.0))
     max_cost_usd_total: float = field(default_factory=lambda: _float("AITX_MAX_COST_USD_TOTAL", 30.0))
-    max_tokens: int = field(default_factory=lambda: _int("AITX_MAX_TOKENS", 32000))
+    max_tokens: int = field(default_factory=lambda: _int("AITX_MAX_TOKENS", 32768))
     tool_result_char_limit: int = field(default_factory=lambda: _int("AITX_TOOL_RESULT_CHARS", 14000))
     deployment_mode: bool = field(default_factory=lambda: _bool("AITX_DEPLOYMENT_MODE", False))
     cache_dir: Path = field(default_factory=lambda: PROJECT_ROOT / _str("AITX_CACHE_DIR", "data/cache"))
@@ -89,7 +89,9 @@ class Settings:
         for m in (self.primary_model, self.verifier_model, self.gemini_model):
             if any(s in m.lower() for s in FORBIDDEN_MODEL_SUBSTRINGS):
                 raise ValueError(f"Mutable model alias not allowed (pin an exact version): {m!r}")
-        if self.effort not in {"low", "medium", "high", "xhigh", "max"}:
+        if not 1 <= self.max_tokens <= 65536 or not 1 <= self.max_attempts <= 5:
+            raise ValueError("Invalid token or retry limit")
+        if self.effort not in {"low", "medium", "high"} or self.verifier_effort not in {"low", "medium", "high"}:
             raise ValueError(f"Invalid effort {self.effort!r}")
 
     @property
@@ -110,7 +112,7 @@ class Settings:
         d["genereviews_dir"] = (
             str(self.genereviews_dir.relative_to(PROJECT_ROOT)) if self.genereviews_dir.is_relative_to(PROJECT_ROOT) else "<external>"
         )
-        d["anthropic_api_key_present"] = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        d["gemini_api_key_present"] = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
         return d
 
 

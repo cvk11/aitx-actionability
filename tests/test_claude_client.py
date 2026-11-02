@@ -13,6 +13,10 @@ from aitx.llm.base import BudgetExceeded, CostTracker, ModelRefusal
 from aitx.retrieval.registry import ToolBox
 from aitx.schemas import JudgeReport
 
+# Legacy Claude client: the `anthropic` package is an optional extra (pyproject `legacy-tests`), not a runtime
+# dependency of the Argon pipeline. Skip cleanly instead of erroring when it is not installed.
+pytest.importorskip("anthropic", reason="legacy Claude client tests require the optional 'legacy-tests' extra (anthropic==2.3.0)")
+
 FINAL = json.dumps({"scores": [{"dimension": "factual_accuracy", "score_1_to_5": 3, "main_problems": []}], "specific_fixable_issues": []})
 
 
@@ -55,7 +59,7 @@ def test_agent_loop_executes_tools_and_parses(settings, fake_http):
     cost = CostTracker()
     from dataclasses import replace
 
-    llm = ClaudeLLM(replace(settings, refusal_fallback=True), cost, client=fc)
+    llm = ClaudeLLM(replace(settings, primary_model="claude-opus-5-5", refusal_fallback=True), cost, client=fc)
     L = EvidenceLedger()
     out = llm.agent(stage="x", system="sys", user="u", output_model=JudgeReport, toolbox=ToolBox(fake_http, L, settings), tool_names=None, max_rounds=3)
     assert out.scores[0].score_1_to_5 == 3

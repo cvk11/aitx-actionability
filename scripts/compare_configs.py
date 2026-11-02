@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """A/B/C comparison (PAID; run only after code review and explicit authorization):
 A_baseline vs B_full (vs C_full_openai once implemented) on one case. Reports per-config cost, heuristic scorecard, development-judge scores
-(the SAME Claude judge for all configs), and which claims verification removed.
+(the SAME Gemini judge for all configs), and which claims verification removed.
 The judge is a development heuristic, not the official score."""
 from __future__ import annotations
 
@@ -38,3 +38,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

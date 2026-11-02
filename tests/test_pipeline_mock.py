@@ -45,7 +45,7 @@ def test_end_to_end_mock(settings, fake_http, test_case):
     # mock output must be rejected by the submission validator
     assert not validate_submission([res.output.model_dump()], ["TEST-0001"]).ok
     # audit provenance
-    assert res.audit["prompts_sha256"] and res.audit["settings"]["primary_model"] == "claude-opus-5-5"
+    assert res.audit["prompts_sha256"] and res.audit["settings"]["primary_model"] == "gemini-4-argon"
     assert any(e["rule"] == "trial_not_recruiting" for e in res.audit["rule_events"])
 
 

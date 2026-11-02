@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+# pytest fallback temp bases (created in CWD when the system temp is unusable)
+pytest-of-*/
+pytest-cache-files-*/
 data/cache/
 data/genereviews/
 outputs/internal/

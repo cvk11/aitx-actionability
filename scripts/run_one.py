@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Process one patient through the full pipeline (PAID: real Claude API calls).
+"""Process one patient through the full pipeline (PAID: real Gemini Argon API calls).
 
   python scripts/run_one.py --case-id AITX-40002            # official case
   python scripts/run_one.py --input my_hypothetical.json     # any valid input object
@@ -54,3 +54,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

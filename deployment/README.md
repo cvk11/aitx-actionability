@@ -15,7 +15,7 @@ Creates `outputs/space_bundle/` (`app.py`, `src/`, `prompts/`, the official temp
 ## Deploy (owner action, after authorization)
 1. Create a Space (SDK: Gradio, Python 3.12), public or private.
 2. Push the contents of `outputs/space_bundle/` to the Space repository.
-3. Space **secrets**: `ANTHROPIC_API_KEY` (required); optional free `NCBI_API_KEY`, `NCBI_EMAIL`. No other model provider key is used. Recommended variables: `AITX_MAX_COST_USD_PER_CASE`, `AITX_MAX_TOOL_ROUNDS` — **identical to the settings used for the submitted reports** (see `outputs/run_manifest.json`).
+3. Space **secrets**: `GEMINI_API_KEY` (required); optional free `NCBI_API_KEY`, `NCBI_EMAIL`. No other model provider key is used. Recommended variables: `AITX_MAX_COST_USD_PER_CASE`, `AITX_MAX_TOOL_ROUNDS` — **identical to the settings used for the submitted reports** (see `outputs/run_manifest.json`).
 4. On start, the app builds the GeneReviews snapshot from NCBI's archive in the background (~1–2 min); requests wait for it.
 5. If private: create a fine-grained, read-only token limited to this Space for the organizers.
 6. Register the Space in https://huggingface.co/spaces/aitxchallenge/aitxchallenge_submission and run the validator.
@@ -28,3 +28,4 @@ Creates `outputs/space_bundle/` (`app.py`, `src/`, `prompts/`, the official temp
 
 ## Open questions for the organizers
 Validator call style and timeout for `/actionability_report`; single object vs array; tolerance for differences caused by live records (e.g., trial status changes).
+

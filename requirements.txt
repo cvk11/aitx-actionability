@@ -1,5 +1,5 @@
 # Pinned runtime dependencies (verified installable 2026-11-01, Python 3.13)
-anthropic==2.3.0
+google-genai==2.34.0
 httpx==0.28.1
 pydantic==2.14.2
 tenacity==9.1.4

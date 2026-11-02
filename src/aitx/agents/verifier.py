@@ -116,20 +116,10 @@ class VerifyContext:
 
 def _statement_text(it: ActionItem) -> str:
     """Everything that will be rendered for the item, so no rendered field escapes verification."""
-    parts = [it.statement]
-    if it.section == Section.BESPOKE:
-        parts.insert(0, f"Verdict: {it.bespoke_verdict or 'UNCERTAIN'}.")
-    if it.human_precedent.strip():
-        parts.append(f"Human treatment precedent: {it.human_precedent}")
-    if it.conditional_action.strip():
-        parts.append(f"Conditional action: {it.conditional_action}")
-    if it.criteria_met:
-        parts.append("Criteria met on available data: " + "; ".join(it.criteria_met))
-    if it.criteria_unassessable:
-        parts.append("Cannot be assessed from the case: " + "; ".join(it.criteria_unassessable))
-    if it.potential_exclusions:
-        parts.append("Potential exclusions: " + "; ".join(it.potential_exclusions))
-    return " ".join(parts)
+    from ..verification_contract import item_text
+
+    prefix = f"Verdict: {it.bespoke_verdict or 'UNCERTAIN'}.\n" if it.section == Section.BESPOKE else ""
+    return prefix + item_text(it)
 
 
 def _claims_payload(items: list[ActionItem], statements_only: bool = False) -> list[dict[str, Any]]:
@@ -164,7 +154,9 @@ def _evidence_packet(claim: dict[str, Any], ledger: EvidenceLedger, vctx: Verify
         blocks.append(f"=== [{r.key}] {r.title}\nsource_type={r.source_type}; text_scope={r.content_scope}; meta={json.dumps(meta, default=str)[:400]}\n"
                       f"patient_variant_mentioned_in_source={'yes: ' + ', '.join(found) if found else 'no'}; "
                       f"passages_shown={info['shown']} of {info['n_passages']}; "
-                      f"negative_or_limiting_passages_shown={info.get('contrast_shown', 0)} of {info.get('contrast_passages', 0)}\n{text}")
+                      f"negative_or_limiting_passages_shown={info.get('contrast_shown', 0)} of {info.get('contrast_passages', 0)}; "
+                      + ("IMPORTANT_EVIDENCE_OMITTED: context budget omitted limiting findings; comprehensive verification is unavailable. "
+                         if info.get('important_evidence_omitted') or info.get('incomplete_context') else "") + f"\n{text}")
     return "\n".join(blocks) if blocks else "(no citation: reasoning claim)"
 
 
@@ -193,7 +185,10 @@ def _conservative_fields(a: ClaimVerdict, b: ClaimVerdict) -> ClaimVerdict:
     ev = min(a.evidence_type, b.evidence_type, key=lambda x: EVIDENCE_STRENGTH.index(x) if x in EVIDENCE_STRENGTH else 0)
     ap = min(a.applicability, b.applicability, key=lambda x: APPLICABILITY_STRENGTH.index(x) if x in APPLICABILITY_STRENGTH else 0)
     upd = {"evidence_type": ev, "applicability": ap, "intervention_matches": a.intervention_matches and b.intervention_matches,
-           "overgeneralization": a.overgeneralization or b.overgeneralization}
+           "overgeneralization": a.overgeneralization or b.overgeneralization,
+           "functional_evidence": a.functional_evidence if a.functional_evidence == b.functional_evidence else "not_assessed",
+           "functional_direction": a.functional_direction if a.functional_direction == b.functional_direction else "mixed_or_conflicting",
+           "functional_context": a.functional_context if a.functional_context == b.functional_context else "unknown"}
     return a if all(getattr(a, k) == v for k, v in upd.items()) else a.model_copy(update=upd)
 
 
@@ -241,6 +236,15 @@ def ground_verdict(v: ClaimVerdict, claim: dict[str, Any], ledger: EvidenceLedge
             upd["applicability"] = "same_gene_other_variant_or_mechanism"
             upd["overgeneralization"] = (v.overgeneralization + " [deterministic] no cited source mentions the patient's exact variant.").strip()
             cov["applicability_downgrades"] += 1
+    if v.functional_evidence == "variant_function":
+        # Identity in one paper and a functional result in another do not form
+        # variant-specific functional evidence. Require the quoted source itself.
+        source = ledger.get(v.quote_source_key)
+        functional = re.search(r"gain.of.function|loss.of.function|increas\w*|reduc\w*|decreas\w*|abolish\w*|enhanc\w*|impair\w*", v.supporting_quote, re.I)
+        if (claim.get("kind") != "molecular_fact" or v.applicability != "same_variant"
+                or not source or not vctx.notations or not mentions_variant(v.supporting_quote, vctx.notations)
+                or not functional or not quote_in_source(v.supporting_quote, source)):
+            upd.update(functional_evidence="not_assessed", functional_direction="unknown", functional_context="unknown")
     return v.model_copy(update=upd) if upd else v
 
 
@@ -258,6 +262,7 @@ def verify_payload(claims: list[dict[str, Any]], ledger: EvidenceLedger, llm: An
                            "reverified": 0, "missing_after_reverification": [], "quote_failures": 0, "applicability_downgrades": 0,
                            "uncited_supported_to_not_checkable": 0, "batches": 0}
     packets = {(c["item_id"], c["claim_index"]): _evidence_packet(c, ledger, vctx) for c in claims}
+    cov["important_context_limits"] = [list(k) for k, packet in packets.items() if "IMPORTANT_EVIDENCE_OMITTED:" in packet]
 
     def batches(cs):
         cur, size = [], 0
@@ -276,9 +281,17 @@ def verify_payload(claims: list[dict[str, Any]], ledger: EvidenceLedger, llm: An
         sources = "\n\n".join(f"##### Evidence for item_id={c['item_id']} claim_index={c['claim_index']}\n{packets[(c['item_id'], c['claim_index'])]}"
                                 for c in batch)
         system = prompts.render("verifier", PATIENT=vctx.patient_block, CLAIMS=json.dumps(batch, indent=1), SOURCES=sources)
-        out = llm.structured(stage=f"{stage}:{tag}", system=system,
-                             user="Verify every claim listed. Return exactly one verdict per (item_id, claim_index).",
-                             output_model=VerificationBatch, effort=effort)
+        try:
+            out = llm.structured(stage=f"{stage}:{tag}", system=system,
+                                 user="Verify every claim listed. Return exactly one verdict per (item_id, claim_index).",
+                                 output_model=VerificationBatch, effort=effort)
+        except Exception as exc:
+            # Do not continue spending/retrying after budget exhaustion or refusal.
+            from ..llm.base import BudgetExceeded, ModelRefusal
+            if isinstance(exc, (BudgetExceeded, ModelRefusal)):
+                raise
+            cov.setdefault("errors", []).append(f"{tag}: {type(exc).__name__}")
+            return
         _collect(out, {(c["item_id"], c["claim_index"]) for c in batch}, got, cov)
 
     for n, b in enumerate(batches(claims)):
@@ -291,6 +304,9 @@ def verify_payload(claims: list[dict[str, Any]], ledger: EvidenceLedger, llm: An
     by_key = {(c["item_id"], c["claim_index"]): c for c in claims}
     for k in list(got):
         got[k] = ground_verdict(got[k], by_key[k], ledger, vctx, cov)
+        if "IMPORTANT_EVIDENCE_OMITTED:" in packets[k] and got[k].verdict == "supported":
+            got[k] = got[k].model_copy(update={"verdict": "insufficient_source_text",
+                                             "rationale": "Important limiting evidence exceeded the context budget; verification is incomplete."})
     cov["missing_after_reverification"] = [[c["item_id"], c["claim_index"]] for c in claims if (c["item_id"], c["claim_index"]) not in got]
     cov["received"] = len(got)
     order = {k: i for i, k in enumerate((c["item_id"], c["claim_index"]) for c in claims)}

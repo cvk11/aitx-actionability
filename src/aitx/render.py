@@ -94,7 +94,8 @@ STATUS_NOTE = {
 
 
 def render_item(item: ActionItem, ledger: EvidenceLedger, accessed: dict[str, str], status: str = "") -> str:
-    return _render_item(item, ledger, accessed) + STATUS_NOTE.get(status, "")
+    qualification = (" " + link_citations(item.mechanism_qualification, ledger)) if item.mechanism_qualification else ""
+    return _render_item(item, ledger, accessed) + qualification + STATUS_NOTE.get(status, "")
 
 
 def _render_item(item: ActionItem, ledger: EvidenceLedger, accessed: dict[str, str]) -> str:
@@ -226,7 +227,13 @@ def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dic
 
 
 def render_report(case_id: str, items: list[ActionItem], synthesis: Synthesis, ledger: EvidenceLedger,
-                  negatives: dict[Section, list[str]] | None = None, evidence_date: str = "", statement_status: dict[str, str] | None = None) -> str:
+                  negatives: dict[Section, list[str]] | None = None, evidence_date: str = "", statement_status: dict[str, str] | None = None,
+                  verification_contracts: dict | None = None) -> str:
+    if verification_contracts is not None:
+        from .verification_contract import contract_errors
+        errors = contract_errors(items, verification_contracts)
+        if errors:
+            raise ValueError("Unverified rendered item: " + "; ".join(errors))
     statement_status = statement_status or {}
     negatives = negatives or {}
     by_sec: dict[Section, list[ActionItem]] = defaultdict(list)

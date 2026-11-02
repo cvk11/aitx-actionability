@@ -11,7 +11,7 @@ Output: {"id": <same id>, "report_markdown": <markdown>}
 No-logging policy (required by the organizers): evaluation inputs and outputs
 are never logged, written to disk, cached on disk, or reused. Deployment mode
 is forced when running on a Space (SPACE_ID set) or AITX_DEPLOYMENT_MODE=true.
-Secrets (ANTHROPIC_API_KEY; optional free NCBI_API_KEY/NCBI_EMAIL) are read
+Secrets (GEMINI_API_KEY; optional free NCBI_API_KEY/NCBI_EMAIL) are read
 from Space secrets only.
 """
 
@@ -40,7 +40,7 @@ from aitx.schemas import PatientCase  # noqa: E402
 logging.basicConfig(level=logging.WARNING)
 if os.environ.get("AITX_DEPLOYMENT_MODE", "").lower() in ("1", "true", "yes", "on"):
     # pipeline/tool log messages can contain gene/variant/clinical text: silence them entirely in deployment
-    for name in ("aitx", "httpx", "httpcore", "anthropic"):
+    for name in ("aitx", "httpx", "httpcore", "google_genai", "google.genai"):
         logging.getLogger(name).setLevel(logging.CRITICAL + 1)
 log = logging.getLogger("aitx.deployment")
 

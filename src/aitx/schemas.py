@@ -146,6 +146,7 @@ class ActionItem(BaseModel):
     criteria_unassessable: list[str] = Field(default_factory=list)
     potential_exclusions: list[str] = Field(default_factory=list)
     human_precedent: str = Field(default="", description="Off-label: who received it, with what outcome. Repurposing: ''.")
+    mechanism_qualification: str = Field(default="", description="Deterministic functional-evidence qualification; do not invent evidence here.")
 
 
 class CandidateHandoff(BaseModel):
@@ -269,6 +270,9 @@ class ClaimVerdict(BaseModel):
                                                    "(always true for claims that name no intervention).")
     rationale: str
     suggested_revision: str = Field(description="Corrected/qualified wording when partially supported; '' otherwise.")
+    functional_evidence: Literal["not_assessed", "identity_or_pathogenicity", "variant_function"] = "not_assessed"
+    functional_direction: Literal["unknown", "gain_of_function", "loss_of_function", "mixed_or_conflicting"] = "unknown"
+    functional_context: Literal["unknown", "mutant_only", "heterozygous_wild_type_mutant", "patient_derived", "other"] = "unknown"
 
 
 class VerificationBatch(BaseModel):
@@ -285,6 +289,7 @@ class ItemRevision(BaseModel):
     new_section: Section | Literal[""] = ""
     revised_statement: str = ""
     revised_title: str = ""
+    revised_claims: list[Claim] = Field(default_factory=list, description="Narrowed atomic claims, with citations; all undergo fresh verification.")
     reason: str
 
 

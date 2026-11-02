@@ -43,6 +43,45 @@ def arm_headings(text: str) -> list[str]:
     return [m.group(1).strip() for m in ARM_HEADING.finditer(text or "")]
 
 
+ELIGIBILITY_HEADING = re.compile(
+    r"\b(?P<general>general (?:study )?(?:requirements|criteria))\s*:|"
+    r"\b(?P<scope>inclusion|exclusion)(?:\s+criteria)?\s*:|"
+    r"(?m:^[\s*\-\u2022]*(?P<scope_line>inclusion|exclusion)(?:\s+criteria)?\s*$)|"
+    # Colon-delimited arm headings may share a line with inclusion criteria.
+    # Requiring a line start would incorrectly make their genes global criteria.
+    r"\b(?P<arm>(?:arm|cohort|group|part)\s+[A-Za-z0-9]+|healthy[ _-]?(?:volunteers?|controls?)|"
+    r"for (?:patients?|participants?|subjects?) with [^\n:]{3,60})\s*:", re.I)
+
+
+def eligibility_blocks(text: str) -> list[dict[str, str]]:
+    """Keep scope and arm attached to verbatim registry text; unknown stays unknown.
+
+    Also accepts inline headings. These blocks do not establish complete patient
+    eligibility: free-text ambiguity and arm selection require registry review.
+    """
+    text = text or ""
+    matches = list(ELIGIBILITY_HEADING.finditer(text))
+    # Include standalone arm headings supported by the existing public parser.
+    events = [(m.start(), m.end(), "general" if m.group("general") else m.group("scope") or m.group("scope_line"), m.group("arm")) for m in matches]
+    events += [(m.start(), m.end(), None, m.group(1)) for m in ARM_HEADING.finditer(text)
+               if not any(a <= m.start() < b for a, b, _, _ in events)]
+    scope, arm, pos = "unknown", "", 0
+    blocks = []
+    for start, end, new_scope, new_arm in sorted(events):
+        if text[pos:start].strip():
+            blocks.append({"scope": scope, "arm": arm, "text": text[pos:start].strip()})
+        if new_scope:
+            scope = new_scope.lower()
+            if scope == "general":
+                arm = ""
+        if new_arm:
+            arm = new_arm.strip()
+        pos = end
+    if text[pos:].strip():
+        blocks.append({"scope": scope, "arm": arm, "text": text[pos:].strip()})
+    return blocks
+
+
 def _flatten(study: dict[str, Any]) -> dict[str, Any]:
     ps = study.get("protocolSection", {})
     idm, st, de = ps.get("identificationModule", {}), ps.get("statusModule", {}), ps.get("designModule", {})
@@ -71,6 +110,7 @@ def _flatten(study: dict[str, Any]) -> dict[str, Any]:
         "healthy_volunteers": el.get("healthyVolunteers"),
         "eligibility_criteria": el.get("eligibilityCriteria", ""),
         "eligibility_arm_headings": arm_headings(el.get("eligibilityCriteria", "")),
+        "eligibility_blocks": eligibility_blocks(el.get("eligibilityCriteria", "")),
         "countries": countries,
         "n_sites": len(locs),
         "recruiting_sites": sum(1 for l in locs if l.get("status") == "RECRUITING"),
@@ -115,7 +155,7 @@ def _content(f: dict[str, Any]) -> str:
 
 META_FIELDS = ("overall_status", "status_verified", "last_update", "min_age_years", "max_age_years", "sex",
                "study_type", "phases", "countries", "conditions", "interventions", "has_expanded_access",
-               "healthy_volunteers", "eligibility_arm_headings")
+               "healthy_volunteers", "eligibility_arm_headings", "eligibility_criteria", "eligibility_blocks")
 
 
 def _register(ledger: EvidenceLedger, f: dict[str, Any], fetched_at: str, tool: str) -> None:

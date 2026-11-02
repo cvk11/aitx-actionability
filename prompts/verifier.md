@@ -23,6 +23,10 @@ Verify the chain patient → variant → mechanism → intervention → evidence
 
 Be strict on trial status/eligibility (including genotype requirements), approval status, human precedent, variant-specific mechanism, ASO/bespoke feasibility verdicts, and doses.
 
+The full_item_statement contains the entire structured item. Judge ALL fields, including title, feasibility verdict, human precedent, conditional actions, eligibility lists, missing information and mechanism qualification. One unsupported clinical assertion makes the full item unsupported; supported atomic facts do not validate auxiliary fields.
+
+For molecular facts, distinguish identity/pathogenicity from experimental function. Set functional_evidence to identity_or_pathogenicity for variant identification or pathogenicity alone; variant_function ONLY for an experimental assay of this exact variant. Set functional_direction to gain_of_function, loss_of_function, mixed_or_conflicting, or unknown, and functional_context to mutant_only, heterozygous_wild_type_mutant, patient_derived, other, or unknown. Quote the actual functional result, not merely the variant name. Other variants, including the same residue, do not establish this variant's direction. Mutant-only assays do not establish a heterozygous therapeutic response. Return not_assessed/unknown for nonfunctional claims. Report conflicting results explicitly.
+
 Claims to verify (JSON):
 {{CLAIMS}}
 

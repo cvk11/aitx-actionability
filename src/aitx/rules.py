@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 
 from .ledger import EvidenceLedger, extract_keys, find_bracket_tokens
-from .retrieval.clinicaltrials import EXPANDED_ACCESS_OPEN, OPEN_STATUSES
+from .retrieval.clinicaltrials import EXPANDED_ACCESS_OPEN, OPEN_STATUSES, eligibility_blocks
 from .schemas import ActionItem, ClaimVerdict, Section
 
 HUMAN_PUBTYPES = {"Case Reports", "Clinical Trial", "Clinical Study", "Clinical Trial, Phase I", "Clinical Trial, Phase II",
@@ -34,7 +34,7 @@ THIS_VARIANT = re.compile(r"\b(this|the patient'?s|the index) variant\b", re.I)
 DIRECTIONAL = re.compile(
     r"\b(potentiat\w*|activat\w*|agonist\w*|positive modulat\w*|enhanc\w*|"
     r"inhibit\w*|antagonist\w*|blocker\w*|negative modulat\w*|suppress\w*|"
-    r"knock[- ]?down|silenc\w*|allele[- ]specific)\b", re.I)
+    r"knock[- ]?down|silenc\w*|allele[- ](?:specific|selective))\b", re.I)
 MECHANISM_APPLICABLE = {"same_variant", "same_gene_same_mechanism"}
 STRENGTH = ["mechanistic_inference", "preclinical_related", "preclinical_same_gene", "human_related_disease_or_mechanism", "human_same_gene",
             "human_same_variant", "guideline_or_expert_review", "regulatory_approval"]
@@ -78,7 +78,18 @@ def _strip_unknown_citations(text: str, ledger: EvidenceLedger) -> tuple[str, li
 
 
 def item_citations(item: ActionItem) -> list[str]:
-    keys = extract_keys(item.statement) + extract_keys(item.human_precedent) + extract_keys(item.conditional_action)
+    # All present and future claim-bearing fields contribute sources to the
+    # full-item verifier, not just the three historically rendered text fields.
+    def strings(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for child in value.values():
+                yield from strings(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from strings(child)
+    keys = [k for value in strings(item.model_dump(mode="json")) for k in extract_keys(value)]
     for c in item.claims:
         keys += c.citations
     seen, out = set(), []
@@ -189,12 +200,27 @@ def apply_section_rules(items: list[ActionItem], ledger: EvidenceLedger, age_yea
                 res.events.append(RuleEvent(it.item_id, "trial_sex_ineligible", "dropped", f"{nct} sex {tsex}"))
                 continue
             # genotype eligibility: a trial restricted to named genes must include the patient's gene
-            named = trial_named_genes(f"{rec.title}\n{rec.content}")
+            blocks = rec.metadata.get("eligibility_blocks")
+            if blocks is None:
+                blocks = eligibility_blocks(rec.metadata.get("eligibility_criteria") or rec.content)
+            global_inclusion = [b["text"] for b in blocks if b["scope"] == "inclusion" and not b["arm"]]
+            # An optional mention or a negated requirement is not a mandatory
+            # genotype criterion. Do not infer restrictions from title/summary.
+            mandatory = [t for t in global_inclusion if not re.search(r"\b(may|optional|no|not|without|exclud\w*|regardless|including|or|e\.g\.)\b", t, re.I)]
+            named = trial_named_genes("\n".join(mandatory))
             if genes and named:
                 if not named & {g.upper() for g in genes}:
-                    res.events.append(RuleEvent(it.item_id, "trial_genotype_ineligible", "dropped", f"{nct} names {sorted(named)[:8]}; patient {genes}"))
+                    res.events.append(RuleEvent(it.item_id, "trial_genotype_ineligible", "dropped", f"{nct} inclusion requires {sorted(named)[:8]}; patient {genes}"))
                     continue
-                it.criteria_met = list(dict.fromkeys(it.criteria_met + [f"Genetic diagnosis in {', '.join(sorted(named & {g.upper() for g in genes}))} (named in the registry record)"]))
+                it.criteria_met = list(dict.fromkeys(it.criteria_met + [f"Genetic diagnosis in {', '.join(sorted(named & {g.upper() for g in genes}))} (named in inclusion criteria; other criteria remain to be assessed)"]))
+            ambiguous_genes = bool(trial_named_genes("\n".join(global_inclusion))) and not named
+            if not global_inclusion or ambiguous_genes or any(b["scope"] in ("unknown", "general") or b["arm"] for b in blocks):
+                it.criteria_unassessable = list(dict.fromkeys(it.criteria_unassessable + [
+                    "Eligibility is uncertain: missing/unscoped or arm-specific criteria require registry and sponsor review; no criteria are transferred between arms"]))
+            excluded = trial_named_genes("\n".join(b["text"] for b in blocks if b["scope"] == "exclusion"))
+            if genes and excluded & {g.upper() for g in genes}:
+                it.potential_exclusions = list(dict.fromkeys(it.potential_exclusions + [
+                    "Patient gene is mentioned in exclusion criteria; confirm scope and wording with the sponsor before eligibility assessment"]))
             arms = rec.metadata.get("eligibility_arm_headings") or []
             if arms:
                 # criteria under an arm/cohort heading belong to that arm only (e.g. healthy-volunteer requirements)
@@ -313,25 +339,44 @@ def apply_verdicts(items: list[ActionItem], verdicts: list[ClaimVerdict], *, led
         # variant. Unless a verified claim applies to this variant or its established mechanism, the dependency and
         # the uncertainty must be stated rather than assumed.
         if it.section in TIER3 and DIRECTIONAL.search(f"{it.title} {it.statement}"):
-            grounded = any(v is not None and v.verdict == "supported" and v.applicability in MECHANISM_APPLICABLE
-                           for _, v in zip(kept, kept_v))
+            functional = [v for c, v in zip(kept, kept_v)
+                          if c.kind == "molecular_fact" and v is not None and v.verdict == "supported"
+                          and v.applicability == "same_variant" and v.functional_evidence == "variant_function"]
+            directions = {v.functional_direction for v in functional}
+            grounded = bool(functional) and len(directions) == 1 and directions <= {"gain_of_function", "loss_of_function"}
+            it.mechanism_qualification = ""
             if not grounded:
+                it.mechanism_qualification = (
+                    "Conditional experimental research hypothesis only: the variant's functional direction is unresolved or conflicting. "
+                    "Variant identity/pathogenicity and findings in other variants do not establish gain or loss of function. "
+                    "Direction-dependent intervention requires variant-specific functional testing, including wild-type/mutant "
+                    "co-expression where relevant, before therapeutic prioritization; patient benefit is not established.")
                 res.events.append(RuleEvent(it.item_id, "mechanism_direction_unestablished", "flagged",
                                             "directional intervention without variant-specific mechanism evidence"))
                 res.problem(it.item_id, "This candidate's rationale depends on the direction of the variant's functional effect "
                                         "(e.g. potentiation vs inhibition), but no verified claim establishes that direction for this "
                                         "variant. State the dependency and the uncertainty explicitly, or drop the candidate.")
+            elif not all(v.functional_context in ("heterozygous_wild_type_mutant", "patient_derived") for v in functional):
+                it.mechanism_qualification = (
+                    "Conditional experimental research hypothesis: variant-specific functional direction was measured, but the "
+                    "wild-type/mutant context and therapeutic response remain unestablished. Test the patient's allelic context "
+                    "before therapeutic prioritization; patient benefit is not established.")
         if it.section != Section.TRIALS and OVERCLAIM.search(it.statement + " " + it.human_precedent):
             status = "needs_reverification" if status in ("supported", "hypothesis") else status
             res.problem(it.item_id, "Statement predicts benefit for this patient or overstates certainty; report only what the evidence shows "
                                     "(a response in a published individual does not show that this patient will respond).")
         ok = [(c, v) for c, v in zip(kept, kept_v) if v is None or v.verdict in OK_VERDICTS]
         factual = [(c, v) for c, v in ok if c.kind not in REASONING_KINDS and (v is None or v.verdict == "supported")]
-        if not factual:
+        recoverable = any(v is not None and v.verdict == "partially_supported" and c.citations
+                          and c.kind not in REASONING_KINDS for c, v in zip(kept, kept_v))
+        if not factual and not recoverable:
             res.events.append(RuleEvent(it.item_id, "no_verified_factual_claim", "dropped", "only reasoning or unverified claims remain"))
             continue
         req = REQUIRED_KINDS.get(it.section, set())
-        if req and not any(c.kind in req for c, _ in ok):
+        if not factual and recoverable:
+            status = "pending_revision"
+            res.problem(it.item_id, "No fully supported factual premise yet: narrow the partial claims and re-verify within the revision budget.")
+        if req and not any(c.kind in req for c, _ in ok) and not recoverable:
             res.events.append(RuleEvent(it.item_id, "core_claims_unsupported", "dropped", f"no supported {sorted(req)} claim remains"))
             continue
         # -------- evidence-based tier gate
@@ -407,14 +452,21 @@ def compose_from_verified_claims(it: ActionItem, verdicts: list[ClaimVerdict]) -
     """Last-resort salvage: rebuild a statement ONLY from claims that were individually verified as supported
     (verbatim claim texts + their citations). Used when no supportable free-text wording was found."""
     vs = {v.claim_index: v for v in verdicts if v.item_id == it.item_id}
-    parts = []
+    parts, claims = [], []
     for i, c in enumerate(it.claims):
         v = vs.get(i)
         if v is not None and v.verdict == "supported" and c.kind not in REASONING_KINDS and c.citations:
             parts.append(c.text.rstrip(". ") + " " + " ".join(f"[{k}]" for k in c.citations) + ".")
+            claims.append(c.model_copy(deep=True))
     if not parts:
         return None
-    return it.model_copy(update={"statement": " ".join(parts), "conditional_action": "", "human_precedent": "" if it.section != Section.OFF_LABEL else it.human_precedent})
+    # Construct a fresh item: no unverified auxiliary assertion may hitchhike on
+    # verified atoms. Even this reconstruction must pass full-item verification.
+    human = " ".join(p for c, p in zip(claims, parts) if c.kind == "treatment_effect_human") if it.section == Section.OFF_LABEL else ""
+    return ActionItem(item_id=it.item_id, section=it.section, title=it.title,
+                      statement=" ".join(parts), conditional_action="", evidence_level=it.evidence_level,
+                      priority=it.priority, claims=claims, missing_information=[], nct_id=it.nct_id,
+                      bespoke_verdict="UNCERTAIN" if it.section == Section.BESPOKE else "", human_precedent=human)
 
 
 def _norm_title(t: str) -> set[str]:
