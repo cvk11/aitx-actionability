@@ -1,4 +1,4 @@
-"""Tool registry exposed to the research agents (Claude client-side tools).
+"""Tool registry exposed to the research agents (provider-neutral client-side tools).
 
 All schemas are strict (every property required, no additional properties),
 so tool inputs are schema-valid; "" / [] mean "not used".
