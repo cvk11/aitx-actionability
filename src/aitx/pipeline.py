@@ -31,6 +31,7 @@ from .render import render_report
 from .retrieval.registry import ToolBox
 from .rules import apply_citation_rules, apply_section_rules, apply_verdicts, compose_from_verified_claims, find_cross_section_duplicates
 from .schemas import ActionItem, ClaimVerdict, PatientCase, ReportOutput, Section, Synthesis
+from .verification_contract import contract_errors, item_digest, item_text, text_digest
 
 log = logging.getLogger(__name__)
 MOCK_BANNER = "> **MOCK OUTPUT — generated with the offline mock LLM; not genuine research and never to be submitted.**"
@@ -186,7 +187,7 @@ class Pipeline:
                 items, problems = self._rules(items, ledger, age, sex, audit, genes)
                 if changed and self.verify_claims:
                     ch = [i for i in items if i.item_id in changed]
-                    kept = {i.item_id: i for i in self._verify(ch, ledger, vstate, problems, audit, f"revision{r}", statements_only=True)}
+                    kept = {i.item_id: i for i in self._verify(ch, ledger, vstate, problems, audit, f"revision{r}")}
                     items = [kept[i.item_id] if i.item_id in changed else i for i in items if i.item_id not in changed or i.item_id in kept]
 
             # ---- final verification gate: only items whose FULL statement is verified are rendered
@@ -197,15 +198,10 @@ class Pipeline:
                         comp = compose_from_verified_claims(i, vstate["verdicts"].get(i.item_id, []))
                         if comp is not None:
                             salvaged[i.item_id] = comp
-                            vstate["status"][i.item_id] = "composed_from_verified_claims"
                             add_issue(audit, "info", "statement_composed_from_verified_claims",
-                                      f"{i.item_id}: free-text statement not verifiable; rendered from its individually verified claims only")
+                                      f"{i.item_id}: rebuilt from verified atoms; requires fresh full-item verification")
                 items = [salvaged.get(i.item_id, i) for i in items]
-                bad = [i for i in items if vstate["status"].get(i.item_id, "unverified") not in OK_STATUS]
-                for i in bad:
-                    add_issue(audit, "info", "item_dropped_statement_not_verified",
-                              f"{i.item_id}: statement status '{vstate['status'].get(i.item_id, 'unverified')}' after {S.max_revisions} revision rounds")
-                items = [i for i in items if i not in bad]
+                items = self._final_gate(items, ledger, vstate, problems, audit)
             for k, v in problems.items():
                 if any(i.item_id == k for i in items):
                     for p in v:
@@ -226,7 +222,8 @@ class Pipeline:
             add_issue(audit, "critical", "stage_incomplete", f"{type(e).__name__}: {e}; report rendered from items verified so far")
             log.error("%s", e)
             if self.verify_claims:  # never render items whose statement was not verified
-                items = [i for i in items if vstate["status"].get(i.item_id) in OK_STATUS]
+                items = [i for i in items if not contract_errors([i], audit.get("item_contracts", {}))]
+                synthesis = Synthesis(summary_lines=[], missing_information=[], duplicate_item_ids_to_drop=[], outcome_measures=[], calibration_notes=[])
 
         return self._finish(case, ctx, ledger, toolbox, audit, t0, items, synthesis, negatives, verdicts)
 
@@ -258,8 +255,15 @@ class Pipeline:
 
     def _finish(self, case, ctx, ledger, toolbox, audit, t0, items, synthesis, negatives, verdicts) -> CaseResult:
         # ---- render + QC (deterministic)
+        contracts = audit.get("item_contracts", {})
+        if self.verify_claims and self.mode == "full":
+            errors = contract_errors(items, contracts)
+            if errors:
+                add_issue(audit, "critical", "final_item_verification_failed", "; ".join(errors))
+                items = [i for i in items if not contract_errors([i], contracts)]
         evidence_date = time.strftime("%Y-%m-%d", time.gmtime())
-        md = render_report(case.id, items, synthesis, ledger, negatives, evidence_date, statement_status=audit.get("statement_status", {}))
+        md = render_report(case.id, items, synthesis, ledger, negatives, evidence_date, statement_status=audit.get("statement_status", {}),
+                           verification_contracts=contracts if self.verify_claims and self.mode == "full" else None)
         if self.is_mock:
             lines = md.split("\n", 1)
             md = lines[0] + "\n\n" + MOCK_BANNER + "\n" + (lines[1] if len(lines) > 1 else "")
@@ -284,6 +288,7 @@ class Pipeline:
             except Exception as e:  # pragma: no cover
                 audit["judge_error"] = str(e)
         audit["final_items"] = [i.model_dump(mode="json") for i in items]
+        audit["rendered_sha256"] = text_digest(md)
         audit["heuristic_scorecard"] = heuristic_scorecard(items, verdicts, ledger, md)
         audit["cost"] = self.cost.summary()
         audit["tool_calls"] = toolbox.calls
@@ -297,6 +302,67 @@ class Pipeline:
         return res
 
     # ------------------------------------------------------------ helpers
+    def _final_gate(self, items, ledger, vstate, problems, audit):
+        """Fresh final decisions, then exact content binding after all mutations.
+
+        Recovery is over: partial atoms cannot enter the final item. Reconstructed
+        and revised items get the same gate; no status string bypasses it.
+        """
+        from .rules import OVERCLAIM, REASONING_KINDS, TIER3
+
+        ready = []
+        for it in items:
+            vs = {v.claim_index: v for v in vstate["verdicts"].get(it.item_id, [])}
+            # Composed items already contain only supported claims; verify their
+            # fresh indices below instead of borrowing old index provenance.
+            composed = any(x["code"] == "statement_composed_from_verified_claims" and x["detail"].startswith(it.item_id + ":")
+                           for x in audit["issues"])
+            claims = it.claims if composed else [c for n, c in enumerate(it.claims) if n in vs and
+                         (vs[n].verdict == "supported" or (vs[n].verdict == "not_checkable" and c.kind in REASONING_KINDS))]
+            if not any(c.kind not in REASONING_KINDS and c.citations for c in claims):
+                add_issue(audit, "info", "item_dropped_no_verified_premise", it.item_id)
+                continue
+            ready.append(it.model_copy(update={"claims": claims}))
+        ready = self._verify(ready, ledger, vstate, problems, audit, "final_candidates")
+        candidates = []
+        for it in ready:
+            if vstate["status"].get(it.item_id) not in ("supported", "hypothesis"):
+                continue
+            vs = {v.claim_index: v for v in vstate["verdicts"].get(it.item_id, [])}
+            claims = [c for n, c in enumerate(it.claims) if n in vs and
+                      (vs[n].verdict == "supported" or (vs[n].verdict == "not_checkable" and c.kind in REASONING_KINDS))]
+            if any(c.kind not in REASONING_KINDS and c.citations for c in claims):
+                candidates.append(it.model_copy(update={"claims": claims}))
+        ready = candidates
+        # apply_verdicts can change tier, evidence level or mechanism qualifiers.
+        # Verify the exact final object once more, with no subsequent mutation.
+        vr = verifier.llm_verify(ready, ledger, self.verifier_llm, self.settings.verifier_effort,
+                                 statements_only=True, vctx=vstate.get("vctx"))
+        rows = {v.item_id: v for v in vr.verdicts if v.claim_index == -1}
+        audit["stages"]["final_item_verification"] = {
+            "coverage": vr.coverage, "inputs": {i.item_id: item_digest(i) for i in ready},
+            "verdicts": [v.model_dump(mode="json") for v in vr.verdicts]}
+        if not vr.complete:
+            add_issue(audit, "critical", "final_verification_incomplete", "Missing final full-item decisions after bounded retry")
+        contracts, kept = {}, []
+        for it in ready:
+            v = rows.get(it.item_id)
+            # A reasoning-only full-statement decision cannot certify categorical
+            # clinical auxiliary assertions. Those require a supported decision.
+            safe_aux = (it.bespoke_verdict in ("", "UNCERTAIN") and not it.human_precedent
+                        and not it.criteria_met and not it.potential_exclusions)
+            hypothesis = it.section in TIER3 and safe_aux and v is not None and v.verdict == "not_checkable"
+            if (v is None or (v.verdict != "supported" and not hypothesis) or v.overgeneralization.strip()
+                    or OVERCLAIM.search(item_text(it))):
+                add_issue(audit, "info", "item_dropped_statement_not_verified", it.item_id)
+                continue
+            status = "hypothesis" if hypothesis else "supported"
+            contracts[it.item_id] = {"digest": item_digest(it), "status": status}
+            vstate["status"][it.item_id] = status
+            kept.append(it)
+        audit["item_contracts"] = contracts
+        return kept
+
     def _verify(self, items, ledger, vstate, problems, audit, tag, statements_only=False):
         """Verify items (claims + full statements, or statements only) and apply decisions fail-closed.
         Updates vstate (statement status per item; re-indexed claim verdicts) and problems; returns kept items."""

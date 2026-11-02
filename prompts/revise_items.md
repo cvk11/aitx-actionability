@@ -10,5 +10,7 @@ Problems:
 Items:
 {{ITEMS}}
 
+For partially supported claims, provide narrowed revised_claims with their original ledger citations as well as the revised_statement. Revised claims and all auxiliary fields undergo fresh independent verification. An unchanged or empty revision cannot make rejected content verified.
+
 Evidence digest:
 {{EVIDENCE}}
