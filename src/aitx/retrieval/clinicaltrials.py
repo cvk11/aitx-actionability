@@ -47,8 +47,10 @@ ELIGIBILITY_HEADING = re.compile(
     r"\b(?P<general>general (?:study )?(?:requirements|criteria))\s*:|"
     r"\b(?P<scope>inclusion|exclusion)(?:\s+criteria)?\s*:|"
     r"(?m:^[\s*\-\u2022]*(?P<scope_line>inclusion|exclusion)(?:\s+criteria)?\s*$)|"
-    r"(?m:^[\s*\-\u2022]*(?P<arm>(?:arm|cohort|group|part)\s+[A-Za-z0-9]+|healthy[ _-]?(?:volunteers?|controls?)|"
-    r"for (?:patients?|participants?|subjects?) with [^\n:]{3,60})\s*:)", re.I)
+    # Colon-delimited arm headings may share a line with inclusion criteria.
+    # Requiring a line start would incorrectly make their genes global criteria.
+    r"\b(?P<arm>(?:arm|cohort|group|part)\s+[A-Za-z0-9]+|healthy[ _-]?(?:volunteers?|controls?)|"
+    r"for (?:patients?|participants?|subjects?) with [^\n:]{3,60})\s*:", re.I)
 
 
 def eligibility_blocks(text: str) -> list[dict[str, str]]:
