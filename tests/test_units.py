@@ -23,7 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_official_file_hashes():
     table = (ROOT / "data" / "official" / "SOURCES.md").read_text()
     for path, sha in re.findall(r"\| `([^`]+)` \| https://\S+ \| ([0-9a-f]{64}) \|", table):
-        assert hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == sha, path
+        # Windows checkouts (core.autocrlf=true) may store CRLF; the recorded hashes are for LF content.
+        data = (ROOT / path).read_bytes().replace(b"\r\n", b"\n")
+        assert hashlib.sha256(data).hexdigest() == sha, path
 
 
 def test_official_cases_validate(official_cases):

@@ -225,6 +225,7 @@ def test_b7_parallel_reservations_are_atomic():
 
 
 def test_b7_call_refused_when_upper_bound_exceeds_budget(settings):
+    pytest.importorskip("anthropic", reason="legacy Claude client tests require the optional 'legacy-tests' extra")
     from aitx.llm.anthropic_client import ClaudeLLM
     from aitx.schemas import JudgeReport
 
