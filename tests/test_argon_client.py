@@ -45,6 +45,7 @@ def test_structured_billing_and_no_hidden_calls(settings):
     assert llm.structured(stage='x',system='s',user='u',output_model=Answer).result=='ok'
     cfg=client.calls[0]['config']
     assert cfg.store is False and cfg.automatic_continuation is False
+    assert cfg.service_tier==types.ServiceTier.STANDARD
     assert cfg.automatic_function_calling.disable
     assert cfg.temperature is None and cfg.cached_content is None
     pin,pout,cache=argon_prices()
@@ -137,7 +138,16 @@ def test_full_pipeline_through_argon_responses(settings,fake_http,test_case):
             # The transport is replaced; the production request handling,
             # accounting, JSON parsing, and finalization are still exercised.
             if config.tools:
-                self.client.script.append(response(text='Research complete; finalize.'))
+                base=stage.rsplit(':r',1)[0]
+                seen=getattr(self,'tool_stages',set())
+                names={f.name for t in config.tools for f in t.function_declarations}
+                if base not in seen and 'pubmed_search' in names:
+                    seen.add(base);self.tool_stages=seen
+                    self.client.script.append(response(parts=[types.Part(function_call=types.FunctionCall(
+                        id='retrieval',name='pubmed_search',args={'query':'GENEX','max_results':5,'page':1}),
+                        thought_signature=b'offline-signature')]))
+                else:
+                    self.client.script.append(response(text='Research complete; finalize.'))
             else:
                 prefix=next(p for p in sorted(HANDLERS,key=len,reverse=True) if stage.startswith(p))
                 ctx={'system':config.system_instruction,'toolbox':getattr(self,'tb',None)}
@@ -155,6 +165,7 @@ def test_full_pipeline_through_argon_responses(settings,fake_http,test_case):
     llm=ScriptedGemini(settings,CostTracker(12),client=Client([]))
     r=Pipeline(llm,settings,http=fake_http,parallel=False,cost=llm.cost).run(test_case)
     assert r.audit['stages_completed']
+    assert llm.tool_stages
     assert check_report_structure(r.output.report_markdown,test_case['id']).ok
     assert 'Drug Q cured this patient' not in r.output.report_markdown
     assert not any(i['bespoke_verdict']=='AMENABLE' for i in r.audit['final_items'])
