@@ -122,22 +122,46 @@ class GeminiLLM:
             served = getattr(resp, 'model_version', None) or 'unknown'
             um = getattr(resp, 'usage_metadata', None)
             try:
-                if um is None or um.prompt_token_count is None or um.candidates_token_count is None:
-                    raise ValueError('missing usage')
-                inp, out = int(um.prompt_token_count), int(um.candidates_token_count)
+                if um is None:
+                    raise ValueError('usage metadata absent')
+                inp, out = um.prompt_token_count, um.candidates_token_count
+                if inp is None or out is None:
+                    raise ValueError('prompt/candidates token counts absent')
+                inp, out = int(inp), int(out)
                 thought, cached = int(um.thoughts_token_count or 0), int(um.cached_content_token_count or 0)
                 tool_input = int(um.tool_use_prompt_token_count or 0)
-                if min(inp, out, thought, cached, tool_input) < 0 or cached > inp:
-                    raise ValueError('invalid usage')
-                bill = ((inp - cached + tool_input) * pin + cached * cache_price + (out + thought) * pout) / 1e6
+                if min(inp, out, thought, cached, tool_input) < 0:
+                    raise ValueError('negative token count')
+                # Google documents prompt_token_count as INCLUDING cached tokens, but the live
+                # service has been observed reporting cached_content_token_count above
+                # prompt_token_count on tool-heavy turns (prompt then excludes the cached prefix).
+                # Accept both shapes without double counting: fresh prompt tokens and tool-result
+                # tokens at the input rate, the cached prefix at the cache rate. An anomalous shape
+                # is flagged as uncertain billing (settled at the conservative reserved bound).
+                anomaly = cached > inp
+                fresh = inp - cached if not anomaly else inp
+                bill = ((fresh + tool_input) * pin + cached * cache_price + (out + thought) * pout) / 1e6
                 known = served == MODEL or served.startswith(MODEL + '-')
                 rec = CallRecord(stage=stage, requested_model=self.model, served_model=served,
-                    input_tokens=inp-cached+tool_input, output_tokens=out+thought, cache_read_input_tokens=cached,
-                    cost_usd=bill, seconds=round(now()-start, 2), uncertain_billing=not known)
-            except (ValueError, TypeError, AttributeError):
+                    input_tokens=fresh + tool_input, output_tokens=out + thought, cache_read_input_tokens=cached,
+                    cost_usd=bill, seconds=round(now() - start, 2), uncertain_billing=(not known) or anomaly)
+            except (ValueError, TypeError, AttributeError) as e:
+                # Token counts are accounting data, not provider response bodies or model text; they are
+                # included so a future shape change is diagnosable from the audit without a paid probe.
+                detail = (f'{e}; prompt={getattr(um, "prompt_token_count", None)} '
+                          f'candidates={getattr(um, "candidates_token_count", None)} '
+                          f'cached={getattr(um, "cached_content_token_count", None)} '
+                          f'thoughts={getattr(um, "thoughts_token_count", None)} '
+                          f'tool_use={getattr(um, "tool_use_prompt_token_count", None)}')
                 self.cost.settle(token, CallRecord(stage=stage, requested_model=self.model, served_model=served,
-                    stop_reason='invalid_usage', uncertain_billing=True))
-                raise StructuredOutputError(f'{stage}: missing or invalid billing metadata') from None
+                    stop_reason='invalid_usage', uncertain_billing=True, detail=detail))
+                if attempt + 1 < self.settings.max_attempts:
+                    # A response whose billing cannot be verified is unusable (fail-closed), but a single
+                    # transient metadata omission must not kill the stage: retry like a provider error.
+                    time.sleep(min(8, 2 ** attempt))
+                    continue
+                raise StructuredOutputError(
+                    f'{stage}: missing or invalid billing metadata after retries ({detail})') from None
             self.cost.settle(token, rec)
             if not known:
                 raise StructuredOutputError(f'{stage}: unrecognized served model; no fallback allowed')

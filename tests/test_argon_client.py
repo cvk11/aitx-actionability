@@ -55,14 +55,43 @@ def test_structured_billing_and_no_hidden_calls(settings):
 
 
 @pytest.mark.parametrize('bad', [response(finish='MAX_TOKENS'),response(finish='CONTINUATION'),
-    response(finish='SAFETY'),response(model='gemini-3.8-flash'),response(usage=None),response(text='PATIENT_SECRET'),
-    None, response(parts=[types.Part(text='{"result":"ok"}'),types.Part(function_call=types.FunctionCall(name='unrequested',args={}))])])
+    response(finish='SAFETY'),response(model='gemini-3.8-flash'),response(text='PATIENT_SECRET'),
+    response(parts=[types.Part(text='{"result":"ok"}'),types.Part(function_call=types.FunctionCall(name='unrequested',args={}))])])
 def test_incomplete_or_wrong_provider_output_fails_closed(settings,bad):
     llm,client,cost=invoke(settings,[bad])
     with pytest.raises(StructuredOutputError) as e:
         llm.structured(stage='x',system='s',user='u',output_model=Answer)
     assert 'PATIENT_SECRET' not in str(e.value)
     assert len(client.calls)==1 and cost.reserved_usd==0
+
+
+@pytest.mark.parametrize('bad', [response(usage=None), None])
+def test_absent_usage_metadata_retries_then_fails_closed(settings, monkeypatch, bad):
+    # Third real paid run: one tool-heavy turn returned a response whose usage metadata could not be
+    # verified and the stage died without a retry. Missing metadata must retry (like a provider error)
+    # and only fail closed after the attempt budget, never accepting unverifiable content.
+    monkeypatch.setattr('aitx.llm.gemini_client.time.sleep', lambda _: None)
+    llm,client,cost=invoke(settings,[bad]*3)
+    with pytest.raises(StructuredOutputError) as e:
+        llm.structured(stage='x',system='s',user='u',output_model=Answer)
+    assert len(client.calls)==3
+    assert 'after retries' in str(e.value)
+    assert [c.stop_reason for c in cost.calls]==['invalid_usage']*3
+    assert all(c.uncertain_billing for c in cost.calls)
+    assert cost.reserved_usd==0
+
+
+def test_invalid_usage_recovers_when_next_attempt_has_valid_metadata(settings, monkeypatch):
+    # The retry path must reuse the ordinary accounting: one uncertain invalid-usage record followed by
+    # a normally billed successful call, with no leftover reservations.
+    monkeypatch.setattr('aitx.llm.gemini_client.time.sleep', lambda _: None)
+    um = types.GenerateContentResponseUsageMetadata(prompt_token_count=10, thoughts_token_count=5)
+    llm,client,cost=invoke(settings,[response(usage=um),response()])
+    assert llm.structured(stage='x',system='s',user='u',output_model=Answer).result=='ok'
+    assert len(client.calls)==2
+    assert cost.calls[0].stop_reason=='invalid_usage' and cost.calls[0].uncertain_billing
+    assert cost.calls[1].stop_reason=='' and not cost.calls[1].uncertain_billing
+    assert cost.reserved_usd==0 and cost.total_usd>0
 
 
 def test_budget_blocks_before_request(settings):
@@ -184,6 +213,45 @@ def test_agent_fails_closed_when_history_cannot_fit(settings):
     assert "context limit" in str(e.value)
     assert llm.compacted_rounds == 0  # nothing could be trimmed
     assert cost.reserved_usd == 0  # the over-limit request was never reserved/sent
+
+
+def test_usage_with_cached_above_prompt_is_accepted_and_billed_consistently(settings):
+    # Second real paid run: on a tool-heavy turn the live API reported cached_content_token_count ABOVE
+    # prompt_token_count (prompt excluding the cached prefix) and the client failed closed with
+    # "missing or invalid billing metadata". Both shapes must be billed without double counting:
+    # fresh prompt + tool results at input rate, cached prefix at the cache rate, flagged uncertain.
+    um = types.GenerateContentResponseUsageMetadata(prompt_token_count=5000, candidates_token_count=100,
+                                                    thoughts_token_count=200, cached_content_token_count=20000,
+                                                    tool_use_prompt_token_count=3000)
+    llm, client, cost = invoke(settings, [response(usage=um)])
+    assert llm.structured(stage="x", system="s", user="u", output_model=Answer).result == "ok"
+    rec = cost.calls[0]
+    pin, pout, cache = argon_prices()
+    assert rec.input_tokens == 5000 + 3000  # fresh prompt + tool results (prompt excludes cached in this shape)
+    assert rec.cache_read_input_tokens == 20000
+    assert rec.output_tokens == 300
+    # uncertain billing settles at the conservative reserved bound, so the ledger charge must be at
+    # least the computed bill and never below it
+    bill = (8000 * pin + 20000 * cache + 300 * pout) / 1e6
+    assert rec.cost_usd >= bill
+    assert rec.uncertain_billing is True  # anomalous shape is flagged, never silently trusted
+
+
+def test_invalid_usage_error_includes_token_counts_for_diagnosis(settings, monkeypatch):
+    # When the shape is genuinely unusable (e.g. a required field missing), the client must still fail
+    # closed after the retry budget — but the recorded call detail and the error carry the raw token
+    # counts (accounting data, not provider text) so a future service change is diagnosable from the
+    # audit without a paid probe.
+    monkeypatch.setattr('aitx.llm.gemini_client.time.sleep', lambda _: None)
+    um = types.GenerateContentResponseUsageMetadata(prompt_token_count=10, thoughts_token_count=5)
+    llm, client, cost = invoke(settings, [response(usage=um)] * 3)
+    with pytest.raises(StructuredOutputError) as e:
+        llm.structured(stage="x", system="s", user="u", output_model=Answer)
+    msg = str(e.value)
+    assert "billing metadata" in msg and "candidates=None" in msg
+    assert cost.calls[0].stop_reason == "invalid_usage" and cost.calls[0].uncertain_billing is True
+    assert "candidates=None" in cost.calls[0].detail  # survives in the audit even if the error is truncated
+    assert cost.reserved_usd == 0
 
 
 def test_real_sdk_request_serialization_without_network(settings):

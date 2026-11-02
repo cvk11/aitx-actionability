@@ -104,8 +104,20 @@ Temiz ortam: Python 3.12.10, `.venv`, `pip install -r requirements.txt && pip in
 
 **Sonraki denemenin maliyet riski:** Önceki koşu, hiçbir madde doğrulanmadan 17 turda $4.30 harcadı; vaka sınırı $12 uygulama koruması aşımda güvenle keser (sağlayıcı tavanı değil). Sıkıştırma ile koşunun tamamlanması beklenir; gerçekçi aralık ~$4–12 (ITPR1 token hacmi hâlâ ölçülmedi). Koşudan önce: anahtar rotasyonu (sızan anahtar iptali), `python scripts/build_genereviews_index.py` (ilk koşuda "snapshot not built" hataları vardı) ve Google faturalama uyarıları.
 
-## 8. Nihai karar
+## 8. İkinci gerçek koşu: `missing or invalid billing metadata` (B_emerging:r1)
+
+Düzeltilmiş dal ile yapılan ikinci ücretli denemede bağlam tükenmesi **bir daha görülmedi** (sıkıştırma çalıştı; negatif bellek de gerçek koşuda kendini gösterdi: `recent upstream failure cached for PMC2707164`). Yeni ve erken bir hata çıktı: `B_emerging:r1: missing or invalid billing metadata` → yine fail-closed abort (submittable:false, 0 madde, $2.95, 35 çağrının 34'ü sorunsuz).
+
+**Teşhis:** Sorunlu çağrı, araç-ağır bir turdu (rezervasyon ~234KB payload gösteriyor). SDK dokümanı `prompt_token_count`'un cached'i İÇERDİĞİNİ söylüyor; kod `cached > prompt` durumunu geçersiz sayıyordu. Canlı servis, araç sonuçlarının baskın olduğu turlarda prompt'u cached hariç raporlamış olabilir (35 çağrıdan yalnızca bu tek çağrı düştü; aynı desendeki C_hypothesized:r1 geçti).
+
+**Düzeltme:** `gemini_client._send` artık her iki raporlama şeklini de kabul ediyor, çift sayım yapmadan faturalıyor: taze prompt + araç sonuçları input tarifesinden, cached önek cache tarifesinden; anormal şekil `uncertain_billing` olarak işaretlenip rezerve edilen üst sınırdan muhafazakâr yazılıyor (eksik faturalama yok). Gerçekten kullanılamaz metadata'da fail-closed korunuyor ve hata mesajı artık ham token sayaçlarını içeriyor (muhasebe verisi; sağlayıcı metni değil) — bir sonraki şekil değişikliği ücretli prob olmadan denetimden teşhis edilebilir.
+
+**Bu koşunun çıktıları:** `AITX-40002.md` boş rapor (tüm bölümler "No qualifying action identified… absence does not establish that none exists") — bu fail-closed tasarımın doğru sonucudur: uydurma yok, yanlış "yok" yok, gönderilemez işaretli. Yapısal QC geçti ("At least one section appears empty" uyarısı ile). Bilimsel içerik taşımaz; yalnızca abort'un eseridir.
+
+Regresyon testleri: anormal şekil kabulü + tutarlı faturalama; kullanılamaz şekilde sayaçlı hata (2 yeni test).
+
+## 9. Nihai karar
 
 **READY FOR ONE CONTROLLED ARGON RETRY**
 
-Bağlam tükenmesi ve Europe PMC davranışı kök nedene kadar izlendi, düzeltmeler regresyon testleriyle sabitlendi, tam paket yeşil (sayılar §3'te), hiçbir bilimsel güvence gevşetilmedi, fail-closed davranış korundu. Tek kontrollü AITX-40002 yeniden denemesi için hazır; `run_all.py`, yarışma başvurusu ve `main` merge'i yetkili değildir.
+Birinci koşunun iki kusuru (bağlam tükenmesi, Europe PMC tekrarı) gerçek koşuda doğrulandı ve çözüldü; ikinci koşunun yeni kusuru (billing metadata şekli) tolere edilip regresyon testleriyle sabitlendi, tam paket yeşil. Fail-closed davranış korunuyor; boş rapor asla gönderilemez sayılmıyor. Tek kontrollü AITX-40002 yeniden denemesi için hazır; `run_all.py`, yarışma başvurusu ve `main` merge'i yetkili değildir.
