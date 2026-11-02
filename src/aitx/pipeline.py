@@ -151,8 +151,14 @@ class Pipeline:
                 add_issue(audit, "critical", "verification_disabled", "claim verification disabled (ablation arm): report is not submittable")
 
             # ---- candidate handoffs + open questions are researched, never silently dropped
-            if handoffs or open_q:
-                items, problems = self._handoffs(ctx, items, ledger, toolbox, age, sex, genes, problems, audit, vstate, handoffs, open_q)
+            cov_requests, cov_rows = researcher.coverage_gaps(ctx.dossier or {}, items)
+            audit["stages"]["therapeutic_coverage"] = cov_rows
+            for r in cov_rows:
+                if r["error"]:
+                    add_issue(audit, "warning", "coverage_query_failed", f"{r['gene']} {r['family']}: query failed ({r['error']}); coverage gap")
+            if handoffs or open_q or cov_requests:
+                items, problems = self._handoffs(ctx, items, ledger, toolbox, age, sex, genes, problems, audit, vstate, handoffs, open_q,
+                                                 cov_requests)
 
             # ---- E optional independent review
             if self.reviewer_llm is not None:
@@ -291,7 +297,8 @@ class Pipeline:
     def _verify(self, items, ledger, vstate, problems, audit, tag, statements_only=False):
         """Verify items (claims + full statements, or statements only) and apply decisions fail-closed.
         Updates vstate (statement status per item; re-indexed claim verdicts) and problems; returns kept items."""
-        if not items:
+        if not items:  # recorded, so the submission gate can tell "nothing to verify" from "verification skipped"
+            audit["stages"].setdefault("D_verification_rounds", []).append({"tag": tag, "coverage": {"expected": 0}, "verdicts": []})
             return []
         vr = verifier.llm_verify(items, ledger, self.verifier_llm, self.settings.verifier_effort, statements_only=statements_only,
                                  vctx=vstate.get("vctx"))
@@ -321,11 +328,15 @@ class Pipeline:
         _merge(problems, s.problems)
         return s.items, problems
 
-    def _handoffs(self, ctx, items, ledger, toolbox, age, sex, genes, problems, audit, vstate, handoffs, open_q):
-        """Research every cross-section handoff and open question once (bounded), with provenance; verify like all items."""
-        requests = [f"[{h['handoff_id']}] {h['intervention']} -> proposed section {h['proposed_section']}: {h['reason']} "
-                    f"(cites: {', '.join(h['citations'])})" for h in handoffs] + [f"[open question] {q}" for q in open_q[:6]]
-        fu = researcher.followup(ctx, self.llm, toolbox, requests[:10], items, max_rounds=min(10, self.settings.max_tool_rounds))
+    def _handoffs(self, ctx, items, ledger, toolbox, age, sex, genes, problems, audit, vstate, handoffs, open_q, cov_requests=()):
+        """Research every cross-section handoff, mandatory-coverage gap and open question once (bounded), with provenance;
+        verify like all items."""
+        requests = ([f"[{h['handoff_id']}] {h['intervention']} -> proposed section {h['proposed_section']}: {h['reason']} "
+                     f"(cites: {', '.join(h['citations'])})" for h in handoffs] + list(cov_requests)
+                    + [f"[open question] {q}" for q in open_q[:6]])
+        if len(requests) > 14:
+            add_issue(audit, "warning", "followup_requests_truncated", f"{len(requests) - 14} follow-up requests not researched in this run")
+        fu = researcher.followup(ctx, self.llm, toolbox, requests[:14], items, max_rounds=min(10, self.settings.max_tool_rounds))
         seen = {i.item_id for i in items}
         new_items = [it.model_copy(update={"item_id": researcher.unique_id(f"ho-{it.item_id}", seen)}) for it in fu.items]
         new_items, p = self._rules(new_items, ledger, age, sex, audit, genes)

@@ -23,6 +23,23 @@ def assemble_submission(results: list[Any], expected_ids: list[str], *, allow_mo
     for r in results:
         blockers = [b for b in r.blockers if not (allow_mock and b["code"] == "mock_output")]
         problems += [f"{r.output.id}: [{b['code']}] {b['detail']}" for b in blockers]
+        # independent completion checks (not only the issue list): a result object that skipped stages,
+        # verification or synthesis checking must never be submitted, whatever its blocker list says
+        a = r.audit
+        if not a.get("stages_completed"):
+            problems.append(f"{r.output.id}: mandatory stages not recorded as completed")
+        if a.get("mode") == "baseline":
+            problems.append(f"{r.output.id}: baseline comparison arm is not submittable")
+        elif a.get("verify_claims", True):
+            rounds = a.get("stages", {}).get("D_verification_rounds") or []
+            if not rounds:
+                problems.append(f"{r.output.id}: no claim-verification round recorded")
+            if any(x.get("coverage", {}).get("missing_after_reverification") for x in rounds):
+                problems.append(f"{r.output.id}: claim verification incomplete")
+            if "F_synthesis_verification" not in a.get("stages", {}):
+                problems.append(f"{r.output.id}: synthesis verification not recorded")
+        else:
+            problems.append(f"{r.output.id}: claim verification disabled")
         qc = r.audit.get("qc", {})
         if not qc.get("structure", {}).get("ok") or not qc.get("links", {}).get("ok"):
             problems.append(f"{r.output.id}: structural or citation-link QC failed")

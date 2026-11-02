@@ -131,7 +131,14 @@ def adjudicate(ctx):
     return Adjudication(decisions=[AdjudicationDecision(issue_index=0, decision="reject", rationale="no evidence", research_query="")])
 
 
+def followup(ctx):
+    """Default follow-up researcher: reviews the requests (handoffs / coverage gaps / open questions) and confirms nothing new."""
+    return SectionResearchOutput(items=[], candidate_handoffs=[], open_questions=[],
+                                 searched_but_not_found=["Follow-up requests reviewed; no additional verified candidate."])
+
+
 HANDLERS = {
+    "E_followup": followup,
     "A_interpret": interpret, "B_established": established, "B_emerging": emerging, "C_hypothesized": hypothesized,
     "D_verify": verify, "F_revise": revise, "F_synthesize": synthesize, "E_review": review_issues, "E_adjudicate": adjudicate,
 }

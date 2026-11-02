@@ -70,6 +70,26 @@ def collect_handoffs(outputs: dict[str, SectionResearchOutput]) -> list[dict[str
     return out
 
 
+def coverage_gaps(dossier: dict[str, Any], items: list[ActionItem], per_family: int = 8) -> tuple[list[str], list[dict[str, Any]]]:
+    """Mandatory-coverage check: articles returned by the therapeutic-coverage queries that no candidate cites.
+    Returns (follow-up requests, audit rows). Failed families are reported as gaps, never as absence."""
+    from ..rules import item_citations
+
+    cited = {k for it in items for k in item_citations(it)}
+    requests, rows = [], []
+    for gene, fams in (dossier.get("therapeutic_coverage") or {}).items():
+        for fam, f in fams.items():
+            unused = [k for k in f.get("keys", []) if k not in cited]
+            rows.append({"gene": gene, "family": fam, "total": f.get("total"), "reviewed": len(f.get("keys", [])),
+                         "cited": len(f.get("keys", [])) - len(unused), "unused": unused, "truncated": f.get("truncated"), "error": f.get("error", "")})
+            if unused:
+                lst = "; ".join(f"{k} ({(f.get('titles') or {}).get(k, '')[:90]})" for k in unused[:per_family])
+                requests.append(f"[coverage:{gene}:{fam}] Articles from the mandatory query '{f.get('query')}' that no candidate used: {lst}. "
+                                "Assess each for this patient (intervention, direction of effect vs the variant mechanism, species, variant); "
+                                "propose a candidate only if verified evidence supports it, otherwise list it in searched_but_not_found with the reason.")
+    return requests, rows
+
+
 def merge_items(outputs: dict[str, SectionResearchOutput]) -> tuple[list[ActionItem], dict[Section, list[str]], list[str]]:
     items: list[ActionItem] = []
     seen: set[str] = set()

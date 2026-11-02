@@ -162,8 +162,13 @@ def apply_section_rules(items: list[ActionItem], ledger: EvidenceLedger, age_yea
                 res.events.append(RuleEvent(it.item_id, "trial_not_recruiting", "dropped", f"{nct} status {status}"))
                 continue
             if status != "RECRUITING":
-                # not actively recruiting: kept only with an explicit status label and ranked below recruiting trials
+                # not actively recruiting: kept only with an explicit status label, ranked below recruiting trials, and never
+                # presented as a current enrolment option
                 it.priority = max(it.priority, 50)
+                note = {"NOT_YET_RECRUITING": "Not yet recruiting: a possible future option only; enrolment is not currently possible",
+                        "ENROLLING_BY_INVITATION": "Enrolling by invitation only: not open recruitment"}.get(
+                    status, "Expanded access: not a clinical trial; availability must be confirmed with the sponsor")
+                it.criteria_unassessable = list(dict.fromkeys(it.criteria_unassessable + [note]))
             if rec.metadata.get("status_verification") == "failed":
                 it.criteria_unassessable = list(dict.fromkeys(
                     it.criteria_unassessable + ["Current recruitment status and eligibility could not be re-verified live in this run"]))
@@ -390,6 +395,18 @@ def _norm_title(t: str) -> set[str]:
     stop = {"the", "a", "an", "of", "for", "and", "or", "with", "in", "to", "therapy", "treatment", "aso", "based"}
     return {w for w in re.findall(r"[a-z0-9]+", t.lower()) if w not in stop}
 
+
+
+GENERIC_TITLE_WORDS = {"drug", "drugs", "compound", "agent", "therapy", "therapies", "treatment", "supplementation", "oral", "intravenous",
+                       "gene", "replacement", "mediated", "targeted", "strategy", "approach", "trial", "study", "management", "standard",
+                       "medication", "medications", "inhibitor", "inhibitors", "agonist", "antagonist", "potentiator", "modulator",
+                       "knockdown", "editing"}
+
+
+def distinctive_terms(title: str) -> list[str]:
+    """Tokens that identify a candidate's intervention (generic words removed; purely generic titles keep all words)."""
+    toks = [t for t in _norm_title(title) if t not in GENERIC_TITLE_WORDS]
+    return toks or list(_norm_title(title))
 
 def find_cross_section_duplicates(items: list[ActionItem]) -> list[tuple[str, str]]:
     out = []

@@ -267,11 +267,14 @@ def test_b9_no_unscoped_absence_claim():
     L.log_query("pubmed_search", {"query": "GENEX"}, ["PMID:2"], total=230)
     it = _item("rep", Section.REPURPOSING, [("mice", ["PMID:2"], "treatment_effect_preclinical")], statement="Drug Q rescued mice [PMID:2].",
                evidence_level="preclinical_same_gene")
+    # a gene-level search that never named the candidate is not candidate-specific absence evidence
+    assert "not specifically searched" in render_item(it, L, {})
+    L.log_query("pubmed_search", {"query": "GENEX AND drug Q"}, ["PMID:2"], total=230)
     txt = render_item(it, L, {})
     assert "No human treatment precedent exists" not in txt
     assert "searched in this run" in txt and "first" in txt  # scope + truncation are explicit
     L2 = EvidenceLedger()
-    L2.log_query("pubmed_search", {"query": "x"}, [], error="timeout")
+    L2.log_query("pubmed_search", {"query": "drug Q humans"}, [], error="timeout")
     assert "could not be assessed" in render_item(it, L2, {})
 
 

@@ -56,6 +56,10 @@ def bootstrap(ctx: CaseContext, http: HttpClient, ledger: EvidenceLedger, toolbo
             except Exception as e:  # pragma: no cover
                 dossier["errors"].append(f"{name} {g}: {e}")
                 ledger.log_query(name, {"gene": g}, [], error=str(e)[:200])
+        try:  # mandatory therapeutic coverage (modulators of both directions, human treatment reports, nucleic-acid therapies)
+            dossier.setdefault("therapeutic_coverage", {})[g] = ncbi.therapeutic_coverage_search(http, ledger, g)
+        except Exception as e:  # pragma: no cover
+            dossier["errors"].append(f"coverage {g}: {type(e).__name__}")
         try:
             dossier.setdefault("trials_by_gene", {})[g] = clinicaltrials.search_trials(http, ledger, term=g, open_only=True)
         except Exception as e:  # pragma: no cover
@@ -83,6 +87,10 @@ def dossier_text(d: dict[str, Any], limit: int = 30000) -> str:
         "variant_literature (articles mentioning the exact variant; read before citing)": [
             {"europepmc": [{k: r.get(k) for k in ("key", "title", "year", "pmcid", "open_access")} for r in (x.get("europepmc") or [])[:15]],
              "pubmed": [{k: r.get(k) for k in ("key", "title", "year")} for r in (x.get("pubmed") or [])[:10]]} for x in d.get("variant_literature", [])],
+        "therapeutic_coverage (mandatory queries; every hit must be assessed or explicitly set aside)": {
+            g: {fam: {"query": f["query"], "total": f["total"], "error": f["error"],
+                      "hits": [{"key": k, "title": f["titles"].get(k, "")} for k in f["keys"][:20]]} for fam, f in fams.items()}
+            for g, fams in (d.get("therapeutic_coverage") or {}).items()},
         "open_trials_by_gene_term": {g: [{k: s.get(k) for k in ("nct_id", "title", "overall_status", "study_type")} for s in v.get("studies", [])]
                                      for g, v in (d.get("trials_by_gene") or {}).items()},
         "errors": d.get("errors"),
@@ -99,7 +107,7 @@ def interpret(ctx: CaseContext, llm: Any, toolbox: ToolBox, max_rounds: int) -> 
                     tool_names=INTERPRETER_TOOLS, max_rounds=max_rounds)
     # deterministic cross-check of demographics
     if ctx.clinical.age_years is not None and abs((out.patient_age_years or -1) - ctx.clinical.age_years) > 0.05:
-        log.info("age from parser (%.3f) overrides model (%.3f)", ctx.clinical.age_years, out.patient_age_years)
+        log.info("age from deterministic parser overrides the model value")
         out.patient_age_years = ctx.clinical.age_years
     if ctx.clinical.sex != "unknown" and out.patient_sex != ctx.clinical.sex:
         out.patient_sex = ctx.clinical.sex  # type: ignore[assignment]

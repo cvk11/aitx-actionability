@@ -99,7 +99,7 @@ class ToolBox:
         except TypeError as e:
             result, is_error = {"error": f"bad arguments: {e}"}, True
         except Exception as e:  # network errors etc. are reported to the model, not hidden
-            log.warning("tool %s failed: %s", name, e)
+            log.warning("tool %s failed (%s)", name, type(e).__name__)
             self.ledger.log_query(name, args, [], error=str(e)[:300])
             result, is_error = {"error": f"{type(e).__name__}: {str(e)[:300]}"}, True
         if is_error and not (self.ledger.queries and self.ledger.queries[-1].tool == name and self.ledger.queries[-1].error):

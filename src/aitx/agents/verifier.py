@@ -180,6 +180,22 @@ class VerificationResult:
         return not self.coverage.get("missing_after_reverification")
 
 
+EVIDENCE_STRENGTH = ["none", "mechanistic_inference", "preclinical", "human_other_context", "direct_human_same_disease",
+                     "direct_human_same_gene", "direct_human_same_variant"]
+APPLICABILITY_STRENGTH = ["not_applicable", "other_disease_or_population", "same_gene_other_variant_or_mechanism",
+                          "same_disease_other_gene", "same_gene_same_mechanism", "same_variant"]
+
+
+def _conservative_fields(a: ClaimVerdict, b: ClaimVerdict) -> ClaimVerdict:
+    """Merge two decisions with the same verdict: weakest evidence type and applicability, intervention match only if both agree.
+    (`not_applicable` ranks lowest, so a conflict involving it never upgrades human precedent.)"""
+    ev = min(a.evidence_type, b.evidence_type, key=lambda x: EVIDENCE_STRENGTH.index(x) if x in EVIDENCE_STRENGTH else 0)
+    ap = min(a.applicability, b.applicability, key=lambda x: APPLICABILITY_STRENGTH.index(x) if x in APPLICABILITY_STRENGTH else 0)
+    upd = {"evidence_type": ev, "applicability": ap, "intervention_matches": a.intervention_matches and b.intervention_matches,
+           "overgeneralization": a.overgeneralization or b.overgeneralization}
+    return a if all(getattr(a, k) == v for k, v in upd.items()) else a.model_copy(update=upd)
+
+
 def _collect(out: VerificationBatch, expected: set[tuple[str, int]], got: dict, cov: dict) -> None:
     for v in out.verdicts:
         key = (v.item_id, v.claim_index)
@@ -193,6 +209,10 @@ def _collect(out: VerificationBatch, expected: set[tuple[str, int]], got: dict, 
             cov["conflicting_duplicates"].append(list(key))
             if SEVERITY[v.verdict] > SEVERITY[prev.verdict]:  # keep the most conservative decision
                 got[key] = v
+        elif _conservative_fields(prev, v) != prev:
+            # same verdict, conflicting evidence type / applicability / intervention match: keep the weakest of each
+            cov["conflicting_duplicates"].append(list(key))
+            got[key] = _conservative_fields(prev, v)
         else:
             cov["identical_duplicates"] += 1
 

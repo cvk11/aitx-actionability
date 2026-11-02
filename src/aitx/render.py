@@ -7,6 +7,7 @@ from the evidence ledger.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 
@@ -134,14 +135,23 @@ def _render_item(item: ActionItem, ledger: EvidenceLedger, accessed: dict[str, s
         prec_txt = f" Human treatment precedent: {_ensure_period(link_citations(prec, ledger))}" if prec else ""
         return f"- **{title}:** {stmt}{prec_txt}{cond}{ev}{src}"
     if item.section == Section.REPURPOSING:
-        tail = "" if re.search(r"human (treatment )?precedent", stmt, re.I) else " " + precedent_scope(ledger)
+        tail = "" if re.search(r"human (treatment )?precedent", stmt, re.I) else " " + precedent_scope(ledger, item)
         return f"- **{title}:** {stmt}{tail}{cond}{ev}{src}"
     return f"- **{title}:** {stmt}{cond}{ev}{src}"
 
 
-def precedent_scope(ledger: EvidenceLedger) -> str:
-    """Search-scoped, dated statement about human treatment precedent. Never asserts biological absence."""
+def precedent_scope(ledger: EvidenceLedger, item: ActionItem | None = None) -> str:
+    """Search-scoped, dated statement about human treatment precedent. Never asserts biological absence.
+    With `item`, only literature queries that name this candidate's intervention count: a gene-level search that
+    never mentioned the compound is not evidence that the compound lacks human precedent."""
     qs = ledger.searches_for("pubmed_search", "europepmc_search")
+    if item is not None:
+        from .rules import distinctive_terms
+
+        terms = distinctive_terms(item.title)
+        qs = [q for q in qs if any(re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", json.dumps(q.args, default=str).lower()) for t in terms)]
+        if not qs:
+            return "Human use of this candidate was not specifically searched in this run, so human treatment precedent was not assessed."
     ok = [q for q in qs if not q.error]
     if not qs:
         return "Human treatment precedent was not specifically searched in this run."
@@ -158,7 +168,6 @@ def precedent_scope(ledger: EvidenceLedger) -> str:
 
 
 def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dict[Section, list[str]]) -> str:
-    notes = negatives.get(section, [])
     tools = {
         Section.EXISTING_TARGETED: ("fda_label_search", "genereviews_read", "pubmed_search"),
         Section.SUPPORTIVE: ("genereviews_read", "pubmed_search"),
@@ -188,7 +197,8 @@ def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dic
     fail = f" Retrieval from {', '.join(failed)} failed during this run, so no conclusion can be drawn from that source." if failed else ""
     if not srcs and not failed:
         searched = " No dedicated search was recorded for this section in this run."
-    extra = (" " + " ".join(_ensure_period(link_citations(n, ledger)) for n in notes[:2])) if notes else ""
+    # free-text negative notes from the researchers are unverified model text: kept in the audit, never rendered
+    extra = ""
     return f"- {base}{extra}{searched}{fail}"
 
 

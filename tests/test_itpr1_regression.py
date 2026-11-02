@@ -138,3 +138,17 @@ def test_live_itpr1_evidence_retrieval():
     assert europepmc.load_fulltext(http, L, "PMID:36712939", "PMC9830948") == "loaded"
     text, _ = select_passages(L.get("PMID:36712939"), "ARN11391 selective potentiator ITPR1", extra_terms=["ARN11391"])
     assert "ARN11391" in text
+
+
+@pytest.mark.live
+def test_live_itpr1_mandatory_therapeutic_coverage_finds_both_regression_publications():
+    """Generic (gene-parameterised) coverage queries surface the preclinical potentiator study and the treatment
+    cohort without any case-specific query (the auditor's targeted query was needed before)."""
+    from aitx.config import get_settings
+    from aitx.http import HttpClient
+    from aitx.retrieval import ncbi
+
+    cov = ncbi.therapeutic_coverage_search(HttpClient(get_settings(deployment_mode=True)), EvidenceLedger(), VAR["gene"])
+    assert all(not f["error"] for f in cov.values())
+    assert "PMID:36712939" in cov["activating_modulators"]["keys"]
+    assert "PMID:38844245" in cov["human_treatment_reports"]["keys"]

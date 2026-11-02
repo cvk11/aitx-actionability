@@ -48,6 +48,31 @@ def _json_from_text(text: str) -> Any:
         raise
 
 
+def _get(o: Any, k: str) -> Any:
+    return o.get(k) if isinstance(o, dict) else getattr(o, k, None)
+
+
+def usage_cost(u: Any, served: str) -> tuple[float, tuple[int, int, int, int]]:
+    """Cost of a response. If the usage object lists per-iteration usage (`iterations`, present when the server
+    ran more than one billed attempt, e.g. a refusal fallback), every iteration is priced at its own model
+    (unknown -> most expensive known rate) and the larger of the iteration sum and the top-level figure is charged."""
+    tok = lambda o: tuple(int(_get(o, k) or 0) for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    top = tok(u)
+    top_cost = CostTracker.price(served, *top)
+    its = _get(u, "iterations") or []
+    if not isinstance(its, (list, tuple)) or not its:
+        return top_cost, top
+    it_cost, it_tok = 0.0, [0, 0, 0, 0]
+    for it in its:
+        t = tok(it)
+        model = _get(it, "model") or ""
+        it_cost += CostTracker.price(str(model) if model else "__unknown__", *t)
+        it_tok = [a + b for a, b in zip(it_tok, t)]
+    if it_cost >= top_cost:
+        return it_cost, tuple(it_tok)
+    return top_cost, top
+
+
 class ClaudeLLM:
     name = "claude"
 
@@ -141,10 +166,12 @@ class ClaudeLLM:
             inp, out = getattr(u, "input_tokens", 0) or 0, getattr(u, "output_tokens", 0) or 0
             cw, cr = getattr(u, "cache_creation_input_tokens", 0) or 0, getattr(u, "cache_read_input_tokens", 0) or 0
             fallback_used = any(getattr(b, "type", "") == "fallback" for b in msg.content) or served != self.model
-            # fallback turns are priced at the served model's rate (unknown models at the most expensive known rate)
+            # fallback turns are priced at the served model's rate (unknown models at the most expensive known rate);
+            # every billed iteration (usage.iterations, e.g. a refused attempt before a fallback) is charged as well
+            cost_usd, (inp, out, cw, cr) = usage_cost(u, served)
             self.cost.settle(token, CallRecord(stage=stage, requested_model=self.model, served_model=served, input_tokens=inp, output_tokens=out,
                                                cache_creation_input_tokens=cw, cache_read_input_tokens=cr,
-                                               cost_usd=CostTracker.price(served, inp, out, cw, cr), stop_reason=str(msg.stop_reason),
+                                               cost_usd=cost_usd, stop_reason=str(msg.stop_reason),
                                                seconds=round(now() - t0, 2), request_id=getattr(msg, "_request_id", "") or "",
                                                fallback_used=fallback_used))
             return msg
@@ -161,7 +188,10 @@ class ClaudeLLM:
         try:
             return output_model.model_validate(_json_from_text(raw))
         except (json.JSONDecodeError, ValidationError) as e:
-            raise StructuredOutputError(f"{stage}: invalid structured output: {e}; head={raw[:300]!r}") from e
+            # never put model text or input values into errors/logs (they may contain patient data)
+            where = (sorted({".".join(map(str, x.get("loc", ()))) for x in e.errors()})[:10] if isinstance(e, ValidationError)
+                     else [f"json error at char {e.pos}"])
+            raise StructuredOutputError(f"{stage}: invalid structured output ({type(e).__name__}; {len(raw)} chars; at {where})") from None
 
     # -------------------------------------------------------------- public
     def structured(self, *, stage: str, system: str, user: str, output_model: type[T], effort: str | None = None) -> T:

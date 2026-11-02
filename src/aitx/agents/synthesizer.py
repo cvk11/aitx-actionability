@@ -111,14 +111,9 @@ def fallback_summary(tier: int, items: list[ActionItem]) -> str:
 def _mentions_item(text: str, it: ActionItem) -> bool:
     """The summary text must name the referenced candidate (its intervention), so a synthesis sentence cannot
     swap the intervention while keeping the original citation."""
-    from ..rules import _norm_title
+    from ..rules import distinctive_terms
 
-    generic = {"drug", "drugs", "compound", "agent", "therapy", "therapies", "treatment", "supplementation", "oral", "intravenous", "gene",
-               "replacement", "mediated", "targeted", "strategy", "approach", "trial", "study", "management", "standard", "medication",
-               "medications", "inhibitor", "inhibitors", "agonist", "antagonist", "potentiator", "modulator", "knockdown", "editing"}
-    toks = [t for t in _norm_title(it.title) if t not in generic]
-    if not toks:  # purely generic title (e.g. "Seizure management"): require the original wording
-        toks = list(_norm_title(it.title))
+    toks = distinctive_terms(it.title)
     low = text.lower()
 
     def hit(t: str) -> bool:

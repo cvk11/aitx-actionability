@@ -8,8 +8,8 @@ Evidence-grounded agentic system that turns a confirmed rare-disease genotype + 
 
 | Category | Meaning | Result |
 |---|---|---|
-| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, audit-regression tests (first audit B1–B9, second audit S1–S10, ITPR1 regression examples), Claude-only policy | 105 passed |
-| Live retrieval tests (`pytest -m live`) | Free public APIs (PubMed, CT.gov, ClinVar, FDA labels, Europe PMC, VV/VEP) on the public CFTR example + ITPR1 evidence-retrieval regression | 5 passed |
+| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, audit-regression tests (first audit B1–B9, second audit S1–S10 + residual R1–R9, ITPR1 regression examples), Claude-only policy | 116 passed |
+| Live retrieval tests (`pytest -m live`) | Free public APIs (PubMed, CT.gov, ClinVar, FDA labels, Europe PMC, VV/VEP) on the public CFTR example + ITPR1 evidence-retrieval and therapeutic-coverage regressions | 6 passed |
 | Deterministic scientific checks (`scripts/scientific_checks.py`) | HGVS/transcript/exon/NMD/ClinVar/ClinGen/GeneReviews/trials on the 4 official cases + CFTR control | see `docs/SCIENTIFIC_CHECKS.md` |
 | Genuine LLM clinical inference | Claude research, interpretation, verification | **not run** (requires authorization + `ANTHROPIC_API_KEY`) |
 

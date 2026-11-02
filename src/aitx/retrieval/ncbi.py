@@ -33,6 +33,32 @@ def pubmed_search(http: HttpClient, ledger: EvidenceLedger, query: str, max_resu
             "note": "Titles only. Call pubmed_fetch_abstracts on relevant PMIDs before citing them. Use page=2,3,... to review further hits."}
 
 
+# Mandatory therapeutic-coverage query families (gene-generic). Direction-specific modulator queries are both run,
+# because whether activation or inhibition is appropriate depends on the (uncertain) variant mechanism.
+COVERAGE_FAMILIES = {
+    "activating_modulators": '{g}[tiab] AND (potentiat*[tiab] OR activator*[tiab] OR agonist*[tiab] OR "positive modulator*"[tiab])',
+    "inhibiting_modulators": '{g}[tiab] AND (inhibitor*[tiab] OR antagonist*[tiab] OR blocker*[tiab] OR "negative modulator*"[tiab])',
+    "human_treatment_reports": '{g}[tiab] AND (treat*[tiab] OR therap*[tiab]) AND (patient*[tiab] OR case*[tiab] OR child*[tiab])',
+    "nucleic_acid_therapies": '{g}[tiab] AND (antisense[tiab] OR oligonucleotide*[tiab] OR siRNA[tiab] OR "gene therapy"[tiab] OR "allele-specific"[tiab])',
+}
+
+
+def therapeutic_coverage_search(http: HttpClient, ledger: EvidenceLedger, gene: str, max_results: int = 20) -> dict[str, Any]:
+    """Run every coverage family for a gene; record hits, truncation and failures (a failed family is a coverage gap,
+    never evidence of absence)."""
+    out: dict[str, Any] = {}
+    for fam, tmpl in COVERAGE_FAMILIES.items():
+        q = tmpl.format(g=gene)
+        try:
+            r = pubmed_search(http, ledger, q, max_results)
+            out[fam] = {"query": q, "total": r["total_count"], "keys": [x["key"] for x in r["results"]],
+                        "titles": {x["key"]: x.get("title", "") for x in r["results"]}, "truncated": r["more_pages"], "error": ""}
+        except Exception as e:  # recorded, not fatal
+            ledger.log_query("pubmed_search", {"query": q}, [], error=type(e).__name__)
+            out[fam] = {"query": q, "total": None, "keys": [], "titles": {}, "truncated": False, "error": type(e).__name__}
+    return out
+
+
 def pubmed_summaries(http: HttpClient, ledger: EvidenceLedger, pmids: list[str]) -> list[dict[str, Any]]:
     d = http.get_json(f"{EUTILS}/esummary.fcgi", params={"db": "pubmed", "id": ",".join(pmids), "retmode": "json"})
     out = []
@@ -156,12 +182,20 @@ def clinvar_lookup(http: HttpClient, ledger: EvidenceLedger, gene: str, hgvs_c: 
             acc = r.get("accession", f"VCV{uid}")
             title = r.get("title", "")
             kind = "gene_level_listing" if not hgvs_c else _clinvar_title_matches(title, hgvs_c, transcript)
+            if kind is False and hgvs_c and "[" not in title:
+                # cDNA named on another transcript (or with other numbering): same variant only if the GRCh38 allele is identical
+                if gpos is None and not genomic_tried:
+                    genomic_tried = True
+                    gpos = _resolve_genomic(http, transcript, hgvs_c)
+                loc = _clinvar_grch38(r)
+                if gpos is not None and loc is not None and alleles_equivalent(loc, gpos, http):
+                    kind = "genomic_equivalent_other_transcript"
             if kind == "version_differs":
                 if gpos is None and not genomic_tried:
                     genomic_tried = True
                     gpos = _resolve_genomic(http, transcript, hgvs_c)
                 loc = _clinvar_grch38(r)
-                if gpos is not None and loc is not None and loc == gpos:
+                if gpos is not None and loc is not None and alleles_equivalent(loc, gpos, http):
                     kind = "genomic_equivalent_other_transcript_version"
                 else:
                     mismatch.append({"accession": acc, "title": title, "clinvar_grch38": loc, "patient_grch38": gpos,
@@ -240,6 +274,45 @@ def _trim(chrom: str, pos0: int, ref: str, alt: str) -> tuple:
     while ref and alt and ref[0] == alt[0]:
         ref, alt, pos0 = ref[1:], alt[1:], pos0 + 1
     return (chrom, pos0, ref, alt)
+
+
+def _left_align(t: tuple, seq: str, start0: int) -> tuple:
+    """Shift a pure insertion/deletion to its leftmost position using reference sequence `seq` (starting at 0-based `start0`)."""
+    acc, pos0, ref, alt = t
+    if ref and alt:
+        return t
+    allele = ref or alt
+    while pos0 - 1 >= start0 and pos0 - 1 - start0 < len(seq) and seq[pos0 - 1 - start0].upper() == allele[-1]:
+        allele = seq[pos0 - 1 - start0].upper() + allele[:-1]
+        pos0 -= 1
+    return (acc, pos0, allele, "") if ref else (acc, pos0, "", allele)
+
+
+def alleles_equivalent(a: tuple, b: tuple, http: HttpClient | None = None) -> bool:
+    """Same allele on the same versioned reference. Minimal forms are compared first; differing pure indels of the
+    same type and length near each other (repeat regions) are compared after left-alignment against the reference
+    sequence fetched from NCBI. If the reference cannot be fetched the alleles are NOT treated as equivalent."""
+    if a == b:
+        return True
+    if a[0] != b[0] or http is None:
+        return False
+    da, db = (a[2], a[3]), (b[2], b[3])
+    pure = lambda x: (x[0] == "") != (x[1] == "")
+    if not (pure(da) and pure(db)) or (da[0] == "") != (db[0] == "") or len(da[0] or da[1]) != len(db[0] or db[1]) or abs(a[1] - b[1]) > 200:
+        return False
+    n = len(da[0] or da[1])
+    lo, hi = max(0, min(a[1], b[1]) - 250), max(a[1], b[1]) + n + 10
+    try:
+        r = http.request("GET", f"{EUTILS}/efetch.fcgi", params={"db": "nuccore", "id": a[0], "rettype": "fasta", "retmode": "text",
+                                                                 "seq_start": lo + 1, "seq_stop": hi})
+        if r.status != 200 or not r.text.startswith(">"):
+            return False
+        seq = "".join(r.text.splitlines()[1:]).strip().upper()
+    except Exception:
+        return False
+    if len(seq) < hi - lo - 5:
+        return False
+    return _left_align(a, seq, lo) == _left_align(b, seq, lo)
 
 
 def _norm_vcf(v: str) -> tuple | None:
