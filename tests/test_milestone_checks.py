@@ -60,4 +60,4 @@ def test_retrieval_status_categories():
     L.log_query("clinvar_lookup", {}, [])
     L.log_query("clinvar_lookup", {}, ["CLINVAR:VCV1"])
     L.log_query("clinvar_lookup", {}, [], error="timeout")
-    assert L.retrieval_status()["clinvar_lookup"] == {"with_results": 1, "empty": 1, "failed": 1}
+    assert L.retrieval_status()["clinvar_lookup"] == {"with_results": 1, "empty": 1, "failed": 1, "truncated": 0}

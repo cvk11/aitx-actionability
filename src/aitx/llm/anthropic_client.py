@@ -20,12 +20,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from ..config import PRICES_PER_MTOK, Settings
-from .base import CallRecord, CostTracker, ModelRefusal, StructuredOutputError, now
+from ..config import Settings
+from .base import CallRecord, CostTracker, ModelRefusal, StructuredOutputError, max_prices, now
 
 log = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
@@ -57,7 +58,8 @@ class ClaudeLLM:
         if client is None:
             import anthropic
 
-            client = anthropic.Anthropic(max_retries=4, timeout=900.0)
+            # SDK auto-retries are disabled: every attempt must pass through our budget reservation
+            client = anthropic.Anthropic(max_retries=0, timeout=900.0)
         self.client = client
 
     # ------------------------------------------------------------------ core
@@ -79,27 +81,74 @@ class ClaudeLLM:
             kwargs["tools"] = tools
             if tool_choice:
                 kwargs["tool_choice"] = tool_choice
-        t0 = now()
-        if self.settings.refusal_fallback:
-            with self.client.beta.messages.stream(betas=[FALLBACK_BETA], fallbacks="default", **kwargs) as stream:
-                msg = stream.get_final_message()
-        else:
-            with self.client.messages.stream(**kwargs) as stream:
-                msg = stream.get_final_message()
-        u = msg.usage
-        served = getattr(msg, "model", self.model) or self.model
-        inp, out = getattr(u, "input_tokens", 0) or 0, getattr(u, "output_tokens", 0) or 0
-        cw, cr = getattr(u, "cache_creation_input_tokens", 0) or 0, getattr(u, "cache_read_input_tokens", 0) or 0
-        fallback_used = any(getattr(b, "type", "") == "fallback" for b in msg.content) or served != self.model
-        self.cost.record(CallRecord(stage=stage, requested_model=self.model, served_model=served, input_tokens=inp, output_tokens=out,
-                                    cache_creation_input_tokens=cw, cache_read_input_tokens=cr,
-                                    cost_usd=CostTracker.price(served if served in PRICES_PER_MTOK else self.model, inp, out, cw, cr),
-                                    stop_reason=str(msg.stop_reason), seconds=round(now() - t0, 2),
-                                    request_id=getattr(msg, "_request_id", "") or "", fallback_used=fallback_used))
+        msg = self._send_with_budget(stage, kwargs)
         if msg.stop_reason == "refusal":
             sd = getattr(msg, "stop_details", None)
             raise ModelRefusal(stage, getattr(sd, "category", None), getattr(sd, "explanation", None))
         return msg
+
+    def _upper_bound_usd(self, kwargs: dict[str, Any]) -> float:
+        """Conservative cost bound for one request: all input billed at the most expensive cache-write rate of any
+        model a fallback could reach, plus max_tokens at the most expensive output rate (~3 characters per token)."""
+        p = max_prices()
+        chars = len(json.dumps({k: kwargs.get(k) for k in ("system", "messages", "tools")}, default=str))
+        in_tokens = chars / 3 + 2000
+        return (in_tokens * max(p["input"], p["cache_write"]) + kwargs["max_tokens"] * p["output"]) / 1e6
+
+    def _send_with_budget(self, stage: str, kwargs: dict[str, Any]) -> Any:
+        import anthropic
+
+        last: Exception | None = None
+        for attempt in range(1, self.settings.max_attempts + 1):
+            token = self.cost.reserve(f"{stage}#a{attempt}", self._upper_bound_usd(kwargs))
+            t0 = now()
+            try:
+                if self.settings.refusal_fallback:
+                    with self.client.beta.messages.stream(betas=[FALLBACK_BETA], fallbacks="default", **kwargs) as stream:
+                        msg = stream.get_final_message()
+                else:
+                    with self.client.messages.stream(**kwargs) as stream:
+                        msg = stream.get_final_message()
+            except anthropic.RateLimitError as e:  # rejected before processing: not billed
+                self.cost.settle(token, None)
+                last = e
+                time.sleep(min(60.0, float(getattr(getattr(e, "response", None), "headers", {}).get("retry-after", 2 ** attempt) or 2 ** attempt)))
+                continue
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529:  # overloaded: not processed
+                    self.cost.settle(token, None)
+                elif e.status_code >= 500:  # possibly processed: charge the reserved upper bound
+                    self.cost.settle(token, CallRecord(stage=stage, requested_model=self.model, served_model="unknown", stop_reason=f"http_{e.status_code}",
+                                                       seconds=round(now() - t0, 2), uncertain_billing=True))
+                else:
+                    self.cost.settle(token, None)
+                    raise
+                last = e
+                time.sleep(2 ** attempt)
+                continue
+            except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+                self.cost.settle(token, CallRecord(stage=stage, requested_model=self.model, served_model="unknown", stop_reason="connection_error",
+                                                   seconds=round(now() - t0, 2), uncertain_billing=True))
+                last = e
+                time.sleep(2 ** attempt)
+                continue
+            except Exception:
+                self.cost.settle(token, CallRecord(stage=stage, requested_model=self.model, served_model="unknown", stop_reason="client_error",
+                                                   seconds=round(now() - t0, 2), uncertain_billing=True))
+                raise
+            u = msg.usage
+            served = getattr(msg, "model", self.model) or self.model
+            inp, out = getattr(u, "input_tokens", 0) or 0, getattr(u, "output_tokens", 0) or 0
+            cw, cr = getattr(u, "cache_creation_input_tokens", 0) or 0, getattr(u, "cache_read_input_tokens", 0) or 0
+            fallback_used = any(getattr(b, "type", "") == "fallback" for b in msg.content) or served != self.model
+            # fallback turns are priced at the served model's rate (unknown models at the most expensive known rate)
+            self.cost.settle(token, CallRecord(stage=stage, requested_model=self.model, served_model=served, input_tokens=inp, output_tokens=out,
+                                               cache_creation_input_tokens=cw, cache_read_input_tokens=cr,
+                                               cost_usd=CostTracker.price(served, inp, out, cw, cr), stop_reason=str(msg.stop_reason),
+                                               seconds=round(now() - t0, 2), request_id=getattr(msg, "_request_id", "") or "",
+                                               fallback_used=fallback_used))
+            return msg
+        raise StructuredOutputError(f"{stage}: request failed after {self.settings.max_attempts} attempts: {last}")
 
     @staticmethod
     def _text(msg: Any) -> str:

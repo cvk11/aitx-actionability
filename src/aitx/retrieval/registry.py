@@ -29,17 +29,17 @@ LS = {"type": "array", "items": {"type": "string"}}
 
 TOOL_SPECS: list[dict[str, Any]] = [
     {"name": "pubmed_search", "description": "Search PubMed (live E-utilities). Returns PMIDs with titles, year, journal, publication types. Use PubMed field tags, e.g. 'GENE[tiab] AND (treatment[tiab] OR therapy[tiab])'. Results are titles only: fetch abstracts before citing.",
-     "input_schema": _obj({"query": S, "max_results": I})},
+     "input_schema": _obj({"query": S, "max_results": I, "page": I})},
     {"name": "pubmed_fetch_abstracts", "description": "Fetch title/abstract/publication types/PMCID for up to 20 PMIDs. Required before citing a PMID.",
      "input_schema": _obj({"pmids": LS})},
-    {"name": "europepmc_search", "description": "Search Europe PMC (includes preprints and open-access flags). Useful for case reports and full-text availability. Query syntax e.g. '\"GENE\" AND \"case report\"'.",
-     "input_schema": _obj({"query": S, "max_results": I})},
+    {"name": "europepmc_search", "description": "Search Europe PMC (includes preprints and open-access flags). Useful for case reports and full-text availability. Query syntax e.g. '\"GENE\" AND \"case report\"'. page=1,2,... reviews further hits.",
+     "input_schema": _obj({"query": S, "max_results": I, "page": I})},
     {"name": "europepmc_fulltext_excerpts", "description": "Open-access full text paragraphs from a PMC article that match keywords (e.g. dose, outcome, adverse). Use to verify human treatment precedent details.",
      "input_schema": _obj({"pmcid": S, "keywords": LS})},
     {"name": "clinvar_lookup", "description": "ClinVar records for a variant (gene + cDNA HGVS + transcript) or, with empty hgvs_c, pathogenic variants in the gene.",
      "input_schema": _obj({"gene": S, "hgvs_c": S, "transcript": S})},
     {"name": "search_trials", "description": "ClinicalTrials.gov API v2 search (live). open_only=true restricts to RECRUITING, NOT_YET_RECRUITING, ENROLLING_BY_INVITATION and AVAILABLE expanded access. Search by condition, free-text term (gene), and/or intervention.",
-     "input_schema": _obj({"condition": S, "term": S, "intervention": S, "open_only": B})},
+     "input_schema": _obj({"condition": S, "term": S, "intervention": S, "open_only": B, "page_token": S})},
     {"name": "get_trial", "description": "Full live ClinicalTrials.gov record: status, full eligibility criteria, ages, interventions, countries. Required before claiming eligibility.",
      "input_schema": _obj({"nct_id": S})},
     {"name": "fda_label_search", "description": "FDA structured product label (openFDA/DailyMed) by drug name, or labels whose INDICATIONS mention a text (gene/disease). sections: subset of indications_and_usage, contraindications, boxed_warning, warnings_and_cautions, warnings, pediatric_use, drug_interactions, pharmacogenomics, mechanism_of_action, dosage_and_administration ([] = all).",
@@ -65,12 +65,13 @@ class ToolBox:
         self.gr = genereviews.get_index(str(settings.genereviews_dir))
         self.calls: list[dict[str, Any]] = []
         self._fns: dict[str, Callable[..., dict[str, Any]]] = {
-            "pubmed_search": lambda query, max_results: ncbi.pubmed_search(http, ledger, query, max_results or 20),
+            "pubmed_search": lambda query, max_results, page: ncbi.pubmed_search(http, ledger, query, max_results or 20, page=page or 1),
             "pubmed_fetch_abstracts": lambda pmids: ncbi.pubmed_fetch_abstracts(http, ledger, pmids),
-            "europepmc_search": lambda query, max_results: europepmc.europepmc_search(http, ledger, query, max_results or 20),
+            "europepmc_search": lambda query, max_results, page: europepmc.europepmc_search(http, ledger, query, max_results or 20, page or 1),
             "europepmc_fulltext_excerpts": lambda pmcid, keywords: europepmc.europepmc_fulltext_excerpts(http, ledger, pmcid, keywords),
             "clinvar_lookup": lambda gene, hgvs_c, transcript: ncbi.clinvar_lookup(http, ledger, gene, hgvs_c, transcript),
-            "search_trials": lambda condition, term, intervention, open_only: clinicaltrials.search_trials(http, ledger, condition, term, intervention, open_only),
+            "search_trials": lambda condition, term, intervention, open_only, page_token: clinicaltrials.search_trials(
+                http, ledger, condition, term, intervention, open_only, page_token=page_token),
             "get_trial": lambda nct_id: clinicaltrials.get_trial(http, ledger, nct_id),
             "fda_label_search": lambda drug, indication_text, sections: drugs.fda_label_search(http, ledger, drug, indication_text, sections),
             "genereviews_find": lambda gene, extra_terms: genereviews.genereviews_find(self.gr, ledger, gene, extra_terms),

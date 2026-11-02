@@ -47,7 +47,8 @@ def main() -> int:
         (out / f"{res.output.id}.output.json").write_text(json.dumps(res.output.model_dump(), indent=1, ensure_ascii=False))
         print(f"audit: {p}")
     print(json.dumps({"id": res.output.id, "cost": res.audit["cost"]["total_usd"], "served_models": res.audit["cost"]["served_models"],
-                      "unresolved": res.unresolved[:10], "scorecard": res.audit["heuristic_scorecard"]}, indent=1))
+                      "submittable": res.submittable, "blockers": res.blockers, "unresolved": res.unresolved[:10],
+                      "scorecard": res.audit["heuristic_scorecard"]}, indent=1))
     return 0
 
 

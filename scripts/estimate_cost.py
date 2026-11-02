@@ -44,7 +44,9 @@ def main() -> int:
         d = nb * (VERIFY_IN * p["input"] + VERIFY_OUT * p["output"]) / 1e6
         rev = s.max_revisions * ((20000 * p["input"] + 5000 * p["output"]) / 1e6 + (15000 * p["input"] + 4000 * p["output"]) / 1e6)
         f = (30000 * p["input"] + 9000 * p["output"]) / 1e6
-        rows[label] = {"A_interpret": a, "BC_research_x3": bc, "D_verify": d, "revision_loop": rev, "F_synthesis": f}
+        fv = (25000 * p["input"] + 5000 * p["output"]) / 1e6 * (1 + frac)  # synthesis verification (+ possible re-verification)
+        rows[label] = {"A_interpret": a, "BC_research_x3": bc, "D_verify": d * (1 + 0.25 * frac), "revision_loop": rev, "F_synthesis": f,
+                       "F_synthesis_verify": fv}
     print(f"model={s.primary_model} prices/MTok={p} max_tool_rounds={s.max_tool_rounds} max_revisions={s.max_revisions} "
           f"cap/case={s.max_cost_usd_per_case} reserve={s.call_reserve_usd}")
     for k, v in rows.items():

@@ -190,10 +190,20 @@ class VariantInterpretation(BaseModel):
     citations: list[str]
 
 
-class Interpretation(BaseModel):
+class Diagnosis(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     disease_name: str
+    inheritance: str
+    variant_hgvs: list[str] = Field(description="transcript:c. notations (from the input) explaining this diagnosis")
+    genotype_consistency: str
+
+
+class Interpretation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    diagnoses: list[Diagnosis] = Field(description="One entry per distinct genetic diagnosis (several monogenic conditions are possible).")
+    disease_name: str = Field(description="Primary diagnosis (first entry of `diagnoses`).")
     disease_identifiers: list[str] = Field(description="OMIM/MONDO/ORPHA identifiers only if retrieved.")
     inheritance: str
     genotype_consistency: str = Field(description="Does zygosity/inheritance fit the disease? Flag inconsistencies.")
@@ -222,6 +232,7 @@ class ClaimVerdict(BaseModel):
     evidence_type: Literal[
         "direct_human_same_variant",
         "direct_human_same_gene",
+        "direct_human_same_disease",
         "human_other_context",
         "preclinical",
         "mechanistic_inference",

@@ -21,7 +21,8 @@ pytest -m live
 
 ## Map
 - `src/aitx/pipeline.py` orchestration (full mode and `baseline` arm A); `src/aitx/factory.py` config arms A/B/C.
-- `src/aitx/rules.py` deterministic tier/citation rules; `src/aitx/qc.py` template/submission validation; `src/aitx/render.py` Markdown.
+- `src/aitx/submission.py` the only gate that may assemble `outputs/aitx_submission.json` (blocks any critical issue).
+- `src/aitx/rules.py` deterministic tier/citation rules + fail-closed `apply_verdicts`; `src/aitx/qc.py` template/submission validation; `src/aitx/render.py` Markdown.
 - `src/aitx/variant_model.py` HGVS parsing, transcript model, NMD rules; `src/aitx/retrieval/` API clients; `src/aitx/ledger.py` evidence ledger.
 - `src/aitx/llm/anthropic_client.py` Claude tool loop / structured outputs / fallback / cost; `src/aitx/agents/` stage logic; `prompts/` templates.
 - Tests: `tests/` (`fake_http.py` = offline API fakes for the fictional gene GENEX; `mock_handlers.py` = scripted LLM stage outputs).

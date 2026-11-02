@@ -62,7 +62,23 @@ def domain_allowed(url: str) -> bool:
 def fetch_url(http: HttpClient, ledger: EvidenceLedger, url: str, keywords: list[str] | None = None, max_chars: int = 8000) -> dict[str, Any]:
     if not url.startswith("https://") or not domain_allowed(url):
         return {"error": "Domain not on the authoritative allow-list; use the structured tools (PubMed, ClinicalTrials.gov, FDA labels, GeneReviews) instead."}
-    r = http.request("GET", url, ok_statuses=(200,))
+    # follow redirects manually: every hop must stay on the allow-list BEFORE it is requested
+    from urllib.parse import urljoin
+
+    current = url
+    for _hop in range(6):
+        r = http.request("GET", current, ok_statuses=(200,), follow_redirects=False)
+        if r.status in (301, 302, 303, 307, 308) and r.location:
+            nxt = urljoin(current, r.location)
+            if not nxt.startswith("https://") or not domain_allowed(nxt):
+                ledger.log_query("fetch_url", {"url": url}, [], error=f"redirect outside allow-list blocked: {nxt[:120]}")
+                return {"error": "The page redirects to a domain outside the authoritative allow-list; it was not followed."}
+            current = nxt
+            continue
+        break
+    else:
+        ledger.log_query("fetch_url", {"url": url}, [], error="too many redirects")
+        return {"error": "too many redirects"}
     if r.status != 200:
         ledger.log_query("fetch_url", {"url": url}, [], error=f"HTTP {r.status}")
         return {"error": f"HTTP {r.status}"}
@@ -77,8 +93,8 @@ def fetch_url(http: HttpClient, ledger: EvidenceLedger, url: str, keywords: list
         lines = [ln for ln in text.splitlines() if any(k in ln.lower() for k in kws)]
         text = "\n".join(lines) if lines else text
     text = text[:max_chars]
-    key = f"URL:{url}"
-    ledger.add(EvidenceRecord(key=key, source_type="web", title=(p.title or url).strip()[:200], url=url, content=text,
+    key = f"URL:{r.url}"
+    ledger.add(EvidenceRecord(key=key, source_type="web", title=(p.title or r.url).strip()[:200], url=r.url, content=text,
                               content_scope="full_text_excerpt", retrieved_by="fetch_url", accessed_at=r.fetched_at)).verified_exists = True
-    ledger.log_query("fetch_url", {"url": url}, [key])
-    return {"key": key, "title": p.title.strip(), "text": text}
+    ledger.log_query("fetch_url", {"url": url, "final_url": r.url}, [key])
+    return {"key": key, "final_url": r.url, "title": p.title.strip(), "text": text}

@@ -16,15 +16,21 @@ def _text(el: ET.Element | None) -> str:
     return "".join(el.itertext()).strip() if el is not None else ""
 
 
-def pubmed_search(http: HttpClient, ledger: EvidenceLedger, query: str, max_results: int = 20, sort: str = "relevance") -> dict[str, Any]:
+def pubmed_search(http: HttpClient, ledger: EvidenceLedger, query: str, max_results: int = 20, sort: str = "relevance", page: int = 1) -> dict[str, Any]:
     max_results = max(1, min(int(max_results), 50))
-    d = http.get_json(f"{EUTILS}/esearch.fcgi", params={"db": "pubmed", "term": query, "retmode": "json", "retmax": max_results, "sort": sort})
+    page = max(1, int(page or 1))
+    retstart = (page - 1) * max_results
+    d = http.get_json(f"{EUTILS}/esearch.fcgi", params={"db": "pubmed", "term": query, "retmode": "json", "retmax": max_results, "sort": sort,
+                                                        "retstart": retstart})
     res = d.get("esearchresult", {})
     ids = res.get("idlist", [])
+    total = int(res.get("count", 0))
     summaries = pubmed_summaries(http, ledger, ids) if ids else []
-    ledger.log_query("pubmed_search", {"query": query}, [f"PMID:{i}" for i in ids])
-    return {"query": query, "total_count": int(res.get("count", 0)), "query_translation": res.get("querytranslation", ""), "results": summaries,
-            "note": "Titles only. Call pubmed_fetch_abstracts on relevant PMIDs before citing them."}
+    # coverage: reviewed hits are those up to the end of this page
+    ledger.log_query("pubmed_search", {"query": query, "page": page}, [f"PMID:{i}" for i in ids], total=max(0, total - retstart))
+    return {"query": query, "page": page, "total_count": total, "returned": len(ids), "more_pages": retstart + len(ids) < total,
+            "query_translation": res.get("querytranslation", ""), "results": summaries,
+            "note": "Titles only. Call pubmed_fetch_abstracts on relevant PMIDs before citing them. Use page=2,3,... to review further hits."}
 
 
 def pubmed_summaries(http: HttpClient, ledger: EvidenceLedger, pmids: list[str]) -> list[dict[str, Any]]:
@@ -108,7 +114,14 @@ def pmid_exists(http: HttpClient, pmids: list[str]) -> dict[str, dict[str, Any]]
 # ------------------------------------------------------------------ ClinVar
 
 def clinvar_lookup(http: HttpClient, ledger: EvidenceLedger, gene: str, hgvs_c: str = "", transcript: str = "", max_results: int = 10,
-                   hgvs_p: str = "") -> dict[str, Any]:
+                   hgvs_p: str = "", genomic_vcf: str = "") -> dict[str, Any]:
+    """ClinVar records for exactly this variant.
+
+    A record counts as evidence for the patient's variant only if its title denotes the same cDNA change on the
+    SAME transcript version, or on another version of the same transcript AND its GRCh38 allele (canonical SPDI)
+    equals the patient's genomic variant (`genomic_vcf` "chr-pos-ref-alt", e.g. from VariantValidator) after
+    identical minimal left-aligned normalisation. Otherwise it is reported as a
+    `version_mismatch_candidate` / `non_matching_hit` and never registered as evidence."""
     terms = []
     if transcript and hgvs_c:
         terms.append(f'"{transcript}:{hgvs_c}"')
@@ -122,6 +135,9 @@ def clinvar_lookup(http: HttpClient, ledger: EvidenceLedger, gene: str, hgvs_c: 
         terms.append(f"{gene}[gene] AND (pathogenic[clinsig] OR likely_pathogenic[clinsig])")
     out: list[dict[str, Any]] = []
     non_matching: list[dict[str, str]] = []
+    mismatch: list[dict[str, Any]] = []
+    gpos = _norm_vcf(genomic_vcf) if genomic_vcf else None
+    genomic_tried = bool(genomic_vcf)
     used = ""
     tried = []
     for t in terms:
@@ -139,10 +155,21 @@ def clinvar_lookup(http: HttpClient, ledger: EvidenceLedger, gene: str, hgvs_c: 
             traits = [t.get("trait_name") for t in gc.get("trait_set", []) if t.get("trait_name")]
             acc = r.get("accession", f"VCV{uid}")
             title = r.get("title", "")
-            exact = (not hgvs_c) or _clinvar_title_matches(title, hgvs_c, transcript)
+            kind = "gene_level_listing" if not hgvs_c else _clinvar_title_matches(title, hgvs_c, transcript)
+            if kind == "version_differs":
+                if gpos is None and not genomic_tried:
+                    genomic_tried = True
+                    gpos = _resolve_genomic(http, transcript, hgvs_c)
+                loc = _clinvar_grch38(r)
+                if gpos is not None and loc is not None and loc == gpos:
+                    kind = "genomic_equivalent_other_transcript_version"
+                else:
+                    mismatch.append({"accession": acc, "title": title, "clinvar_grch38": loc, "patient_grch38": gpos,
+                                     "reason": "same cDNA notation on another transcript version; genomic equivalence not established"})
+                    continue
             row = {"key": f"CLINVAR:{acc}", "title": title, "classification": gc.get("description"), "review_status": gc.get("review_status"),
-                   "last_evaluated": gc.get("last_evaluated"), "conditions": traits, "protein_change": r.get("protein_change")}
-            if not exact:
+                   "last_evaluated": gc.get("last_evaluated"), "conditions": traits, "protein_change": r.get("protein_change"), "match": kind}
+            if kind is False:
                 # loose search hits for OTHER variants are reported but never registered as evidence for this variant
                 non_matching.append({"accession": acc, "title": title})
                 continue
@@ -153,7 +180,7 @@ def clinvar_lookup(http: HttpClient, ledger: EvidenceLedger, gene: str, hgvs_c: 
                 key=f"CLINVAR:{acc}", source_type="clinvar", title=title,
                 url=f"https://www.ncbi.nlm.nih.gov/clinvar/variation/{uid}/", content=content, content_scope="structured_record",
                 retrieved_by="clinvar_lookup", metadata={"classification": gc.get("description"), "review_status": gc.get("review_status"),
-                                                         "conditions": traits, "exact_hgvs_match": bool(hgvs_c)},
+                                                         "conditions": traits, "match": kind},
             ))
             out.append(row)
         if out:
@@ -161,7 +188,8 @@ def clinvar_lookup(http: HttpClient, ledger: EvidenceLedger, gene: str, hgvs_c: 
     ledger.log_query("clinvar_lookup", {"gene": gene, "hgvs_c": hgvs_c, "transcript": transcript, "term_used": used}, [o["key"] for o in out])
     note = ("No ClinVar record whose title matches this exact cDNA change was found (searched; this is not evidence that the "
             "variant is benign or unreported elsewhere)." if hgvs_c and not out else "")
-    return {"term_used": used, "terms_tried": tried, "records": out, "non_matching_hits": non_matching[:5], "note": note}
+    return {"term_used": used, "terms_tried": tried, "records": out, "non_matching_hits": non_matching[:5],
+            "version_mismatch_candidates": mismatch[:5], "note": note}
 
 
 def _norm_c(h: str) -> str:
@@ -169,15 +197,76 @@ def _norm_c(h: str) -> str:
     return re.sub(r"(?<=del|dup|inv)[ACGTN]+", "", h)
 
 
-def _clinvar_title_matches(title: str, hgvs_c: str, transcript: str) -> bool:
-    """True if a ClinVar title such as 'NM_000492.3(CFTR):c.1521_1523delCTT (p.Phe508del)' denotes exactly hgvs_c
-    on the same transcript accession (version may differ). Complex alleles 'c.[a;b]' never match."""
-    m = re.match(r"^\s*([NX][MR]_\d+)(?:\.\d+)?\([^)]*\):(c\.[^\s]+)", title)
-    if not m or "[" in m.group(2):
+def _clinvar_title_matches(title: str, hgvs_c: str, transcript: str):
+    """Classify a ClinVar title such as 'NM_000492.3(CFTR):c.1521_1523delCTT (p.Phe508del)' against the query.
+
+    Returns "exact_transcript_version" (same accession.version and same cDNA change), "version_differs"
+    (same accession, different/unstated version, same cDNA notation -> needs genomic confirmation), or False.
+    Complex alleles 'c.[a;b]' never match."""
+    m = re.match(r"^\s*([NX][MR]_\d+)(\.\d+)?\([^)]*\):(c\.[^\s]+)", title)
+    if not m or "[" in m.group(3):
         return False
-    if transcript and m.group(1) != transcript.split(".")[0]:
+    acc, ver = m.group(1), (m.group(2) or "")
+    q_acc, _, q_ver = transcript.partition(".")
+    if transcript and acc != q_acc:
         return False
-    return _norm_c(m.group(2)) == _norm_c(hgvs_c)
+    if _norm_c(m.group(3)) != _norm_c(hgvs_c):
+        return False
+    if transcript and q_ver and ver == f".{q_ver}":
+        return "exact_transcript_version"
+    return "version_differs"
+
+
+def _resolve_genomic(http: HttpClient, transcript: str, hgvs_c: str) -> tuple | None:
+    """Patient's GRCh38 allele via VariantValidator VCF (lazy import avoids a module cycle)."""
+    try:
+        from .variant import variantvalidator
+
+        vv = variantvalidator(http, transcript, hgvs_c)
+        v = vv.get("vcf_grch38") if vv.get("ok") else None
+        return _norm_vcf(f"{v['chr']}-{v['pos']}-{v['ref']}-{v['alt']}") if v else None
+    except Exception:
+        return None
+
+
+_CHR = {**{f"NC_{i:06d}": str(i) for i in range(1, 23)}, "NC_000023": "X", "NC_000024": "Y", "NC_012920": "MT"}
+
+
+def _trim(chrom: str, pos0: int, ref: str, alt: str) -> tuple:
+    """Minimal allele: trim common suffix first, then common prefix (0-based interbase position).
+    Applied identically to both representations, so a left-aligned VCF and a fully justified SPDI of the
+    same indel reduce to the same tuple."""
+    ref, alt = ref.upper(), alt.upper()
+    while ref and alt and ref[-1] == alt[-1]:
+        ref, alt = ref[:-1], alt[:-1]
+    while ref and alt and ref[0] == alt[0]:
+        ref, alt, pos0 = ref[1:], alt[1:], pos0 + 1
+    return (chrom.removeprefix("chr").upper(), pos0, ref, alt)
+
+
+def _norm_vcf(v: str) -> tuple | None:
+    """'7-117559590-ATCT-A' (VCF, 1-based) -> minimal allele tuple."""
+    parts = re.split(r"[-:]", v.strip())
+    if len(parts) != 4 or not parts[1].isdigit():
+        return None
+    return _trim(parts[0], int(parts[1]) - 1, parts[2], parts[3])
+
+
+def _norm_spdi(spdi: str) -> tuple | None:
+    """'NC_000007.14:117559590:TCTT:T' (SPDI, 0-based) -> minimal allele tuple."""
+    parts = spdi.split(":")
+    if len(parts) != 4 or not parts[1].isdigit():
+        return None
+    chrom = _CHR.get(parts[0].split(".")[0])
+    return _trim(chrom, int(parts[1]), parts[2], parts[3]) if chrom else None
+
+
+def _clinvar_grch38(r: dict[str, Any]) -> tuple | None:
+    """GRCh38 canonical SPDI of a ClinVar esummary record, normalised like `_norm_vcf`."""
+    for vs in r.get("variation_set", []) or []:
+        if vs.get("canonical_spdi"):
+            return _norm_spdi(vs["canonical_spdi"])
+    return None
 
 
 # ------------------------------------------------------------------ RefSeq

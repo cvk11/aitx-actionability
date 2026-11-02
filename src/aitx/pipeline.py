@@ -25,7 +25,7 @@ from .clinical import parse_clinical_context
 from .config import Settings, get_settings
 from .http import HttpClient
 from .ledger import EvidenceLedger
-from .llm.base import BudgetExceeded, CostTracker, ModelRefusal
+from .llm.base import BudgetExceeded, CostTracker, ModelRefusal, StructuredOutputError
 from .qc import check_links_against_ledger, check_report_structure, heuristic_scorecard
 from .render import render_report
 from .retrieval.registry import ToolBox
@@ -36,12 +36,35 @@ log = logging.getLogger(__name__)
 MOCK_BANNER = "> **MOCK OUTPUT — generated with the offline mock LLM; not genuine research and never to be submitted.**"
 
 
+OK_STATUS = ("supported", "not_checkable")
+
+
 @dataclass
 class CaseResult:
     output: ReportOutput
     audit: dict[str, Any]
     is_mock: bool = False
     unresolved: list[str] = field(default_factory=list)
+
+    @property
+    def issues(self) -> list[dict[str, str]]:
+        return self.audit.get("issues", [])
+
+    @property
+    def blockers(self) -> list[dict[str, str]]:
+        """Critical issues: a report with any blocker must never enter the submission file."""
+        return [i for i in self.issues if i["severity"] == "critical"]
+
+    @property
+    def submittable(self) -> bool:
+        return not self.blockers
+
+
+def add_issue(audit: dict[str, Any], severity: str, code: str, detail: str) -> None:
+    """severity: critical (blocks submission) | warning | info."""
+    audit.setdefault("issues", []).append({"severity": severity, "code": code, "detail": detail[:500]})
+    if severity != "info":
+        audit.setdefault("unresolved", []).append(f"[{severity}:{code}] {detail[:300]}")
 
 
 def software_versions() -> dict[str, str]:
@@ -80,7 +103,7 @@ class Pipeline:
         ctx = CaseContext(case=case, clinical=parse_clinical_context(case.patient.clinical_context))
         audit: dict[str, Any] = {"case_id": case.id, "is_mock": self.is_mock, "mode": self.mode, "verify_claims": self.verify_claims, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                  "settings": self.settings.public_dict(), "prompts_sha256": prompts.manifest(), "software": software_versions(),
-                                 "genereviews_snapshot": toolbox.gr.manifest, "stages": {}, "rule_events": [], "unresolved": []}
+                                 "genereviews_snapshot": toolbox.gr.manifest, "stages": {}, "rule_events": [], "unresolved": [], "issues": []}
         unresolved: list[str] = audit["unresolved"]
         S = self.settings
 
@@ -95,11 +118,13 @@ class Pipeline:
         items: list[ActionItem] = []
         negatives: dict[Section, list[str]] = {}
         verdicts: list[ClaimVerdict] = []
+        vstate: dict[str, Any] = {"status": {}, "verdicts": {}, "all": verdicts}
         try:
             # ---- A
             ctx.interpretation = interpreter.interpret(ctx, self.llm, toolbox, max_rounds=min(8, S.max_tool_rounds))
             audit["stages"]["A_interpretation"] = ctx.interpretation.model_dump(mode="json")
             age = ctx.interpretation.patient_age_years if ctx.interpretation.patient_age_years >= 0 else ctx.clinical.age_years
+            age = None if (age is None or age < 0) else age
             sex = ctx.interpretation.patient_sex
 
             # ---- B/C
@@ -111,26 +136,29 @@ class Pipeline:
             # ---- deterministic rules (pass 1)
             items, problems = self._rules(items, ledger, age, sex, audit)
 
-            # ---- D verification
+            # ---- D verification (deterministic, then claim + statement entailment; fail closed)
             det = verifier.deterministic_checks(items, ledger, self.http)
-            items, problems2 = self._rules(items, ledger, age, sex, audit)  # live trial status may have changed
+            items, problems2 = self._rules(items, ledger, age, sex, audit)  # live trial data may have changed
             _merge(problems, problems2)
-            verdicts = verifier.llm_verify(items, ledger, self.verifier_llm, S.verifier_effort) if self.verify_claims else []
-            vres = apply_verdicts(items, verdicts)
-            items = vres.items
-            audit["rule_events"] += [e.__dict__ for e in vres.events]
-            _merge(problems, vres.problems)
-            audit["stages"]["D_verification"] = {"deterministic": det, "verdicts": [v.model_dump(mode="json") for v in verdicts]}
+            audit["stages"]["D_verification"] = {"deterministic": det}
+            if self.verify_claims:
+                items = self._verify(items, ledger, vstate, problems, audit, "initial")
+            else:
+                add_issue(audit, "critical", "verification_disabled", "claim verification disabled (ablation arm): report is not submittable")
 
             # ---- E optional independent review
             if self.reviewer_llm is not None:
-                items, problems = self._review(ctx, items, ledger, toolbox, age, sex, problems, audit)
+                items, problems = self._review(ctx, items, ledger, toolbox, age, sex, problems, audit, vstate)
 
-            # ---- bounded revision loop
+            # ---- bounded revision loop; every changed item is re-verified against its evidence
             for r in range(S.max_revisions):
-                dups = find_cross_section_duplicates(items)
-                for a, b in dups:
-                    problems.setdefault(b, []).append(f"Possible duplicate of item {a} in another section; keep the action only in the best-fitting section.")
+                for a_id, b_id in find_cross_section_duplicates(items):
+                    problems.setdefault(b_id, []).append(f"Possible duplicate of item {a_id} in another section; keep the action only in the best-fitting section.")
+                if self.verify_claims:
+                    for i in items:
+                        st = vstate["status"].get(i.item_id, "unverified")
+                        if st not in OK_STATUS and not problems.get(i.item_id):
+                            problems[i.item_id] = [f"Statement status is '{st}'; rewrite it to say only what the cited sources support."]
                 problems = {k: v for k, v in problems.items() if any(i.item_id == k for i in items)}
                 if not problems:
                     break
@@ -140,30 +168,38 @@ class Pipeline:
                 changed = {x["item_id"] for x in rlog if x["action"] in ("revise", "move")}
                 items, problems = self._rules(items, ledger, age, sex, audit)
                 if changed and self.verify_claims:
-                    sv = verifier.llm_verify([i for i in items if i.item_id in changed], ledger, self.verifier_llm, S.verifier_effort, statements_only=True)
-                    verdicts += sv
-                    vr = apply_verdicts([i for i in items if i.item_id in changed], sv)
-                    keep = {i.item_id: i for i in vr.items}
-                    items = [keep.get(i.item_id, i) if i.item_id in changed else i for i in items if i.item_id not in changed or i.item_id in keep]
-                    _merge(problems, vr.problems)
-            # unresolved statement-level failures after the last round -> drop (conservative)
-            final_bad = {k for k, v in problems.items() if any(p.startswith("Full statement") for p in v)}
-            if final_bad:
-                unresolved += [f"dropped {k}: statement remained unsupported after {S.max_revisions} revision rounds" for k in final_bad]
-                items = [i for i in items if i.item_id not in final_bad]
-            unresolved += [f"{k}: {p}" for k, v in problems.items() if k not in final_bad for p in v]
+                    ch = [i for i in items if i.item_id in changed]
+                    kept = {i.item_id: i for i in self._verify(ch, ledger, vstate, problems, audit, f"revision{r}", statements_only=True)}
+                    items = [kept[i.item_id] if i.item_id in changed else i for i in items if i.item_id not in changed or i.item_id in kept]
 
-            # ---- F synthesis
+            # ---- final verification gate: only items whose FULL statement is verified are rendered
+            if self.verify_claims:
+                bad = [i for i in items if vstate["status"].get(i.item_id, "unverified") not in OK_STATUS]
+                for i in bad:
+                    add_issue(audit, "info", "item_dropped_statement_not_verified",
+                              f"{i.item_id}: statement status '{vstate['status'].get(i.item_id, 'unverified')}' after {S.max_revisions} revision rounds")
+                items = [i for i in items if i not in bad]
+            for k, v in problems.items():
+                if any(i.item_id == k for i in items):
+                    for p in v:
+                        add_issue(audit, "warning", "unresolved_item_problem", f"{k}: {p}")
+
+            # ---- F synthesis (then verified; unverifiable texts fall back / are removed)
             synthesis = synthesizer.synthesize(ctx, self.llm, items, ledger)
             if synthesis.duplicate_item_ids_to_drop:
                 items = [i for i in items if i.item_id not in set(synthesis.duplicate_item_ids_to_drop)]
+            if self.verify_claims:
+                synthesis, scov, sev = synthesizer.verify_synthesis(synthesis, items, ledger, self.verifier_llm, S.verifier_effort)
+                audit["stages"]["F_synthesis_verification"] = {"coverage": scov, "events": sev}
+                if scov.get("missing_after_reverification"):
+                    add_issue(audit, "critical", "synthesis_verification_incomplete", f"no decision for {scov['missing_after_reverification']}")
             audit["stages"]["F_synthesis"] = synthesis.model_dump(mode="json")
-        except BudgetExceeded as e:
-            unresolved.append(f"budget exceeded: {e}; report rendered from items verified so far")
+            audit["stages_completed"] = True
+        except (BudgetExceeded, ModelRefusal, StructuredOutputError) as e:
+            add_issue(audit, "critical", "stage_incomplete", f"{type(e).__name__}: {e}; report rendered from items verified so far")
             log.error("%s", e)
-        except ModelRefusal as e:
-            unresolved.append(f"model refusal: {e}")
-            log.error("%s", e)
+            if self.verify_claims:  # never render items whose statement was not verified
+                items = [i for i in items if vstate["status"].get(i.item_id) in OK_STATUS]
 
         return self._finish(case, ctx, ledger, toolbox, audit, t0, items, synthesis, negatives, verdicts)
 
@@ -187,12 +223,13 @@ class Pipeline:
             items = c.items
             audit["rule_events"] += [e.__dict__ for e in c.events]
             synthesis = synthesizer.synthesize(ctx, self.llm, items, ledger)
-        except (BudgetExceeded, ModelRefusal) as e:
-            audit["unresolved"].append(str(e))
+            audit["stages_completed"] = True
+        except (BudgetExceeded, ModelRefusal, StructuredOutputError) as e:
+            add_issue(audit, "critical", "stage_incomplete", f"{type(e).__name__}: {e}")
+        add_issue(audit, "critical", "comparison_arm_only", "baseline arm A applies no verification: research comparison only, never submittable")
         return self._finish(case, ctx, ledger, toolbox, audit, t0, items, synthesis, negatives, [])
 
     def _finish(self, case, ctx, ledger, toolbox, audit, t0, items, synthesis, negatives, verdicts) -> CaseResult:
-        unresolved = audit["unresolved"]
         # ---- render + QC (deterministic)
         evidence_date = time.strftime("%Y-%m-%d", time.gmtime())
         md = render_report(case.id, items, synthesis, ledger, negatives, evidence_date)
@@ -204,6 +241,16 @@ class Pipeline:
         audit["qc"] = {"structure": qc.__dict__, "links": links.__dict__}
         if not qc.ok:
             raise RuntimeError(f"Structural QC failed for {case.id}: {qc.errors}")
+        if not links.ok:  # fail closed: the renderer sanitizes model text, so this indicates a defect
+            raise RuntimeError(f"Citation link check failed for {case.id}: {links.errors[:5]}")
+        if self.is_mock:
+            add_issue(audit, "critical", "mock_output", "generated with the mock LLM")
+        if not audit.get("stages_completed"):
+            if not any(i["code"] == "stage_incomplete" for i in audit.get("issues", [])):
+                add_issue(audit, "critical", "stage_incomplete", "pipeline did not complete all mandatory stages")
+        for it in items:
+            if it.section == Section.TRIALS and (ledger.get(it.nct_id) and ledger.get(it.nct_id).metadata.get("status_verification") != "live_ok"):
+                add_issue(audit, "critical", "trial_status_unverified", f"{it.nct_id}: current status not re-verified live in this run")
         if self.run_judge and not self.is_mock:
             try:
                 audit["judge"] = synthesizer.judge(ctx, self.llm, md, ledger).model_dump(mode="json")
@@ -217,9 +264,34 @@ class Pipeline:
         audit["retrieval_status"] = ledger.retrieval_status()
         audit["ledger"] = ledger.to_dict()
         audit["seconds"] = round(time.time() - t0, 1)
-        return CaseResult(ReportOutput(id=case.id, report_markdown=md), audit, self.is_mock, unresolved)
+        res = CaseResult(ReportOutput(id=case.id, report_markdown=md), audit, self.is_mock, audit["unresolved"])
+        audit["submittable"] = res.submittable
+        audit["blockers"] = res.blockers
+        return res
 
     # ------------------------------------------------------------ helpers
+    def _verify(self, items, ledger, vstate, problems, audit, tag, statements_only=False):
+        """Verify items (claims + full statements, or statements only) and apply decisions fail-closed.
+        Updates vstate (statement status per item; re-indexed claim verdicts) and problems; returns kept items."""
+        if not items:
+            return []
+        vr = verifier.llm_verify(items, ledger, self.verifier_llm, self.settings.verifier_effort, statements_only=statements_only)
+        vstate["all"].extend(vr.verdicts)
+        audit["stages"].setdefault("D_verification_rounds", []).append({"tag": tag, "coverage": vr.coverage,
+                                                                         "verdicts": [v.model_dump(mode="json") for v in vr.verdicts]})
+        if vr.coverage.get("missing_after_reverification"):
+            add_issue(audit, "critical", "verification_incomplete",
+                      f"{tag}: verifier returned no decision for {vr.coverage['missing_after_reverification']} after bounded re-verification")
+        prior = [v for i in items for v in vstate["verdicts"].get(i.item_id, []) if v.claim_index >= 0] if statements_only else []
+        res = apply_verdicts(items, prior + vr.verdicts, ledger=ledger)
+        audit["rule_events"] += [e.__dict__ for e in res.events]
+        _merge(problems, res.problems)
+        for i in items:
+            vstate["status"][i.item_id] = res.statement_status.get(i.item_id, "dropped")
+        for iid in {v.item_id for v in res.reindexed}:
+            vstate["verdicts"][iid] = [v for v in res.reindexed if v.item_id == iid]
+        return res.items
+
     def _rules(self, items, ledger, age, sex, audit):
         c = apply_citation_rules(items, ledger)
         s = apply_section_rules(c.items, ledger, age, sex)
@@ -229,7 +301,7 @@ class Pipeline:
         _merge(problems, s.problems)
         return s.items, problems
 
-    def _review(self, ctx, items, ledger, toolbox, age, sex, problems, audit):
+    def _review(self, ctx, items, ledger, toolbox, age, sex, problems, audit, vstate):
         rep = rev.review(ctx, self.reviewer_llm, items, ledger)
         adj = rev.adjudicate(rep, self.llm, items, ledger)
         decisions = {d.issue_index: d for d in adj.decisions}
@@ -249,13 +321,12 @@ class Pipeline:
             new_items = [it.model_copy(update={"item_id": f"fu-{it.item_id}"}) for it in fu.items]
             new_items, p = self._rules(new_items, ledger, age, sex, audit)
             verifier.deterministic_checks(new_items, ledger, self.http)
-            v = verifier.llm_verify(new_items, ledger, self.verifier_llm, self.settings.verifier_effort)
-            vr = apply_verdicts(new_items, v)
-            audit["stages"]["E_followup"] = {"raw": fu.model_dump(mode="json"), "verdicts": [x.model_dump(mode="json") for x in v],
-                                             "kept": [i.item_id for i in vr.items]}
-            items = items + vr.items
+            new_items, p2 = self._rules(new_items, ledger, age, sex, audit)
             _merge(problems, p)
-            _merge(problems, vr.problems)
+            _merge(problems, p2)
+            kept = self._verify(new_items, ledger, vstate, problems, audit, "followup")
+            audit["stages"]["E_followup"] = {"raw": fu.model_dump(mode="json"), "kept": [i.item_id for i in kept]}
+            items = items + kept
         return items, problems
 
 
@@ -267,6 +338,7 @@ def _merge(a: dict[str, list[str]], b: dict[str, list[str]]) -> None:
 def save_audit(result: CaseResult, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     p = out_dir / f"{result.output.id}{'.MOCK' if result.is_mock else ''}.audit.json"
-    p.write_text(json.dumps(result.audit | {"unresolved": result.unresolved}, indent=1, default=str), encoding="utf-8")
+    p.write_text(json.dumps(result.audit | {"unresolved": result.unresolved, "submittable": result.submittable}, indent=1, default=str),
+                 encoding="utf-8")
     (out_dir / f"{result.output.id}{'.MOCK' if result.is_mock else ''}.md").write_text(result.output.report_markdown, encoding="utf-8")
     return p

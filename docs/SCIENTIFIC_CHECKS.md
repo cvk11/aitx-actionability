@@ -51,6 +51,9 @@ UniProt'un varyant kalıntısıyla örtüşen özellikleri artık doğru getiril
 
 Bu çalıştırmada hiçbir kaynak "erişim başarısız" değildi; daha önceki bir denemede ClinGen geçici zaman aşımı yaşandı — bu tür durumlar artık ayrı sınıflanıyor ve raporda "retrieval failed, no conclusion" olarak yazılıyor. **Aranıp bulunamamak biyolojik/klinik yokluk anlamına gelmez** (ör. ACTL6B c.1099dup ClinVar'da olmayabilir ama literatürde raporlanmış olabilir; bu, LLM araştırma aşamasında PubMed'de aranmalı).
 
+### Bağımsız denetim sonrası (commit 9be0d2c denetimi, B4)
+ClinVar kaydı artık yalnızca (a) aynı transkript **sürümünde** aynı cDNA değişikliği ya da (b) başka sürümde olup ClinVar kanonik SPDI'si ile hastanın VariantValidator VCF alleli aynı minimal sola-hizalı biçime indirgendiğinde eşitse kanıt sayılıyor. Canlı sonuç: CFTR F508del kaydı (VCV000007105) NM_000492.3 üzerinde başlıklandırılmış; ham koordinatlar farklı normalleştirme nedeniyle farklı görünüyor (VV `g.117559592_117559594del`, ClinVar 117559591–117559593) ama alleller eşit → `genomic_equivalent_other_transcript_version` olarak kabul. ITPR1 ve SYT1 kayıtları `exact_transcript_version`. VEP sonucu yalnızca istenen transkript sürümü için kabul ediliyor.
+
 ### Düzeltilen bilimsel hata (bu kontrollerle bulundu)
 CFTR kontrolünde ClinVar'ın tırnaklı HGVS araması F508del için **başka varyantları** (c.1584+675A>G, c.1624G>T, c.350G>A, kompleks allel …) da döndürüyordu ve tam kayıt listenin sonundaydı. Eski kod tüm isabetleri bu varyantın kanıtı olarak ledger'a ekliyordu → yanlış atıf riski. Artık yalnızca başlığı aynı transkript erişiminde birebir aynı cDNA değişikliğini belirten kayıtlar kaydediliyor; diğerleri `non_matching_hits` olarak ayrı raporlanıyor (`tests/test_units.py::test_clinvar_exact_title_match`).
 

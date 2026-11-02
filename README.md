@@ -2,13 +2,13 @@
 
 Evidence-grounded agentic system that turns a confirmed rare-disease genotype + brief clinical context into a **therapeutic actionability report** in the official format of the SAIL AI-Tx Challenge (final task, Tier 3).
 
-> **Status (2026-11-01, milestone 1):** implementation complete and tested offline; live biomedical retrieval verified against public APIs; **no paid LLM inference has been run yet**, so no genuine reports exist and `outputs/aitx_submission.json` has not been created. Hypothetical patients only — not for clinical use.
+> **Status (2026-11-02, milestone 1 + audit remediation):** implementation complete and tested offline; live biomedical retrieval verified against public APIs; **no paid LLM inference has been run yet**, so no genuine reports exist and `outputs/aitx_submission.json` has not been created. Hypothetical patients only — not for clinical use.
 
 ## What is verified vs. not
 
 | Category | Meaning | Result |
 |---|---|---|
-| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract | 53 passed |
+| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, 24 audit-regression tests | 77 passed |
 | Live retrieval tests (`pytest -m live`) | Free public APIs (PubMed, CT.gov, ClinVar, FDA labels, Europe PMC, VV/VEP) on the public CFTR example | 4 passed |
 | Deterministic scientific checks (`scripts/scientific_checks.py`) | HGVS/transcript/exon/NMD/ClinVar/ClinGen/GeneReviews/trials on the 4 official cases + CFTR control | see `docs/SCIENTIFIC_CHECKS.md` |
 | Genuine LLM clinical inference | Claude research, interpretation, verification | **not run** (requires authorization + `ANTHROPIC_API_KEY`) |
@@ -26,6 +26,7 @@ Passing software tests does not establish scientific or clinical validity.
 - `COST_AND_LIMITATIONS.md` — cost model, spending limits, prepared first run, limitations
 - `deployment/README.md` — Hugging Face Space
 - `AGENTS.md`, `CODEX_REVIEW_GUIDE.md` — instructions for independent code review
+- `REMEDIATION_REPORT.md` — fixes for the independent audit of commit `9be0d2c` (B1–B9 + medium findings)
 
 ## Installation
 Python ≥ 3.11 (developed on 3.13).
@@ -81,7 +82,7 @@ ClinGen, gnomAD, UniProt, GeneReviews, trials) → A interpretation (gene- vs va
 → D verification (PMID existence, live trial status, LLM claim/statement entailment) → [E optional review]
 → bounded revision → F synthesis → deterministic Markdown render → structural QC → {id, report_markdown}
 ```
-Key properties: models cite only evidence-ledger keys retrieved in the same run; links come from the ledger; "searched, not found" vs "retrieval failed" vs confirmed negative are kept distinct; no hardcoded case answers (tested); full audit trail per run.
+Key properties: models cite only evidence-ledger keys retrieved in the same run; links come from the ledger (model-written links stripped; non-ledger links reject the report); verification fails closed (only fully verified statements are rendered); partial or unverified reports cannot enter the submission (`src/aitx/submission.py`); "searched, not found" vs "retrieval failed" vs confirmed negative are kept distinct; no hardcoded case answers (tested); full audit trail per run.
 
 ## Layout
 ```

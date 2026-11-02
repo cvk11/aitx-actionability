@@ -48,7 +48,7 @@ class FakeClient:
 
 def test_agent_loop_executes_tools_and_parses(settings, fake_http):
     script = [
-        msg([NS(type="thinking", thinking=""), NS(type="tool_use", id="t1", name="pubmed_search", input={"query": "GENEX", "max_results": 5})], "tool_use"),
+        msg([NS(type="thinking", thinking=""), NS(type="tool_use", id="t1", name="pubmed_search", input={"query": "GENEX", "max_results": 5, "page": 1})], "tool_use"),
         msg([NS(type="text", text=FINAL)], "end_turn"),
     ]
     fc = FakeClient(script)
@@ -68,7 +68,7 @@ def test_agent_loop_executes_tools_and_parses(settings, fake_http):
 
 
 def test_tool_budget_forces_final_answer(settings, fake_http):
-    use = lambda i: msg([NS(type="tool_use", id=f"t{i}", name="pubmed_search", input={"query": "q", "max_results": 1})], "tool_use")
+    use = lambda i: msg([NS(type="tool_use", id=f"t{i}", name="pubmed_search", input={"query": "q", "max_results": 1, "page": 1})], "tool_use")
     fc = FakeClient([use(0), use(1), msg([NS(type="text", text=FINAL)], "end_turn")])
     llm = ClaudeLLM(settings, CostTracker(), client=fc)
     llm.agent(stage="x", system="s", user="u", output_model=JudgeReport, toolbox=ToolBox(fake_http, EvidenceLedger(), settings), tool_names=None, max_rounds=2)

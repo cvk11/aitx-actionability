@@ -27,4 +27,3 @@ where = ["src"]
 testpaths = ["tests"]
 markers = ["live: hits free public biomedical APIs (no credentials, no cost)"]
 addopts = "-m 'not live'"
-asyncio_default_fixture_loop_scope = "function"

@@ -76,6 +76,7 @@ class QueryLogEntry:
     n_results: int
     result_keys: list[str]
     error: str = ""
+    total_available: int | None = None  # hits the source reported; > n_results means only the first page was reviewed
 
 
 class EvidenceLedger:
@@ -119,22 +120,26 @@ class EvidenceLedger:
         return len(self._records)
 
     # ------------------------------------------------------------ queries
-    def log_query(self, tool: str, args: dict[str, Any], result_keys: list[str], error: str = "") -> None:
+    def log_query(self, tool: str, args: dict[str, Any], result_keys: list[str], error: str = "", total: int | None = None) -> None:
         with self._lock:
-            self.queries.append(QueryLogEntry(tool, dict(args), now_iso(), len(result_keys), list(result_keys), error))
+            self.queries.append(QueryLogEntry(tool, dict(args), now_iso(), len(result_keys), list(result_keys), error, total))
 
     def searches_for(self, *tools: str) -> list[QueryLogEntry]:
         return [q for q in self.queries if q.tool in tools]
 
     def retrieval_status(self) -> dict[str, dict[str, int]]:
-        """Per source/tool: queries that returned records, returned nothing, or FAILED.
+        """Per source/tool: queries that returned records, returned nothing, or FAILED,
+        plus how many were TRUNCATED (the source reported more hits than were reviewed).
 
         'empty' means the query ran and the source had no matching record (not
         proof of biological absence); 'failed' means the source could not be
-        queried (timeout/HTTP error) and nothing can be concluded."""
+        queried (timeout/HTTP error) and nothing can be concluded; 'truncated'
+        means the search was incomplete (first page only)."""
         out: dict[str, dict[str, int]] = {}
         for q in self.queries:
-            d = out.setdefault(q.tool, {"with_results": 0, "empty": 0, "failed": 0})
+            d = out.setdefault(q.tool, {"with_results": 0, "empty": 0, "failed": 0, "truncated": 0})
+            if not q.error and q.total_available is not None and q.total_available > q.n_results:
+                d["truncated"] += 1
             if q.error:
                 d["failed"] += 1
             elif q.n_results:

@@ -64,7 +64,8 @@ def handler(request: httpx.Request) -> httpx.Response:
         db = q.get("db")
         if path.endswith("esearch.fcgi"):
             ids = {"pubmed": ["11111111", "22222222"], "clinvar": ["123"], "gene": ["9999"]}.get(db, [])
-            return _j({"esearchresult": {"count": str(len(ids)), "idlist": ids, "querytranslation": q.get("term", "")}})
+            n = int(q.get("retmax", 20))  # honour retmax like the real API
+            return _j({"esearchresult": {"count": str(len(ids)), "idlist": ids[:n], "querytranslation": q.get("term", "")}})
         if path.endswith("esummary.fcgi"):
             ids = q.get("id", "").split(",")
             if db == "pubmed":
@@ -79,7 +80,9 @@ def handler(request: httpx.Request) -> httpx.Response:
                 return _j({"result": {"uids": ["123"], "123": {"accession": "VCV000000123", "title": "NM_999999.1(GENEX):c.100G>A (p.Asp34Asn)",
                                                               "germline_classification": {"description": "Pathogenic", "review_status": "criteria provided, single submitter",
                                                                                           "last_evaluated": "2024/01/01", "trait_set": [{"trait_name": "GENEX-related epilepsy"}]},
-                                                              "molecular_consequence_list": ["missense variant"], "protein_change": "D34N"}}})
+                                                              "molecular_consequence_list": ["missense variant"], "protein_change": "D34N",
+                                                              "variation_set": [{"canonical_spdi": "NC_000001.11:999:G:A",
+                                                                                 "variation_loc": [{"assembly_name": "GRCh38", "chr": "1", "start": "1000", "stop": "1000"}]}]}}})
             if db == "gene":
                 return _j({"result": {"uids": ["9999"], "9999": {"name": "GENEX", "description": "genex protein", "summary": "GENEX encodes a synaptic protein."}}})
         if path.endswith("efetch.fcgi"):
@@ -90,7 +93,8 @@ def handler(request: httpx.Request) -> httpx.Response:
     if host == "rest.variantvalidator.org":
         return _j({"flag": "gene_variant", "NM_999999.1:c.100G>A": {"hgvs_transcript_variant": "NM_999999.1:c.100G>A",
                    "hgvs_predicted_protein_consequence": {"tlr": "NP_999999.1:p.(Asp34Asn)"}, "gene_symbol": "GENEX",
-                   "primary_assembly_loci": {"grch38": {"hgvs_genomic_description": "NC_000001.11:g.1000G>A"}}, "validation_warnings": []}, "metadata": {}})
+                   "primary_assembly_loci": {"grch38": {"hgvs_genomic_description": "NC_000001.11:g.1000G>A",
+                                                         "vcf": {"chr": "1", "pos": "1000", "ref": "G", "alt": "A"}}}, "validation_warnings": []}, "metadata": {}})
     if host == "rest.ensembl.org":
         return _j([{"most_severe_consequence": "missense_variant", "seq_region_name": "1", "start": 1000, "end": 1000,
                     "transcript_consequences": [{"transcript_id": "NM_999999.1", "consequence_terms": ["missense_variant"], "exon": "2/4", "protein_start": 34,

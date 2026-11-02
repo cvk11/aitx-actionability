@@ -33,7 +33,8 @@ def bootstrap(ctx: CaseContext, http: HttpClient, ledger: EvidenceLedger, toolbo
         dossier["variants"].append(a)
         genes.setdefault(v.gene, (a.get("computed_features") or {}).get("aa_position"))
         try:
-            dossier["clinvar"].append(ncbi.clinvar_lookup(http, ledger, v.gene, v.variant_cdna, v.transcript, hgvs_p=v.variant_protein))
+            dossier["clinvar"].append(ncbi.clinvar_lookup(http, ledger, v.gene, v.variant_cdna, v.transcript, hgvs_p=v.variant_protein,
+                                                       genomic_vcf=_vcf_str((a.get("variantvalidator") or {}).get("vcf_grch38"))))
         except Exception as e:  # pragma: no cover
             dossier["errors"].append(f"clinvar {v.gene}: {e}")
             ledger.log_query("clinvar_lookup", {"gene": v.gene, "hgvs_c": v.variant_cdna}, [], error=str(e)[:200])
@@ -54,6 +55,10 @@ def bootstrap(ctx: CaseContext, http: HttpClient, ledger: EvidenceLedger, toolbo
     dossier["bootstrap_keys"] = ledger.keys()
     dossier["retrieval_status"] = ledger.retrieval_status()
     return dossier
+
+
+def _vcf_str(v: dict | None) -> str:
+    return f"{v['chr']}-{v['pos']}-{v['ref']}-{v['alt']}" if v and all(k in v for k in ("chr", "pos", "ref", "alt")) else ""
 
 
 def dossier_text(d: dict[str, Any], limit: int = 30000) -> str:

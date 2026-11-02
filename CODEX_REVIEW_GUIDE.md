@@ -2,6 +2,9 @@
 
 Goal: find defects that could produce **incorrect or misleading clinical statements**, untraceable citations, rule violations, or privacy/security problems. Prioritise correctness of evidence handling over style. Read `AGENTS.md` first (no paid API calls, no hardcoding).
 
+## 0. Targeted re-review of the remediation (commit after `9be0d2c`)
+Read `REMEDIATION_REPORT.md`. For each B1–B9 row, check the named functions and the regression test in `tests/test_audit_regressions.py`. Priorities: (a) can any path render an item whose full statement lacks a `supported`/`not_checkable` decision (`pipeline.py` final gate, `_verify`, exception branch)? (b) can synthesis text bypass `verify_synthesis`? (c) is `CostTracker.reserve` used before every model request, including Gemini and retries? (d) is `assemble_submission` the only writer of `outputs/aitx_submission.json`? (e) ClinVar SPDI/VCF normalisation (`_trim`) for indels in repeats, MNVs and dups.
+
 ## 1. Biomedical API retrieval — `src/aitx/retrieval/*`, `src/aitx/http.py`
 - Are response shapes parsed defensively (missing keys, empty lists, HTTP 4xx/5xx, HTML instead of JSON)?
 - `ncbi.clinvar_lookup`: exact-match logic `_clinvar_title_matches` / `_norm_c` — false negatives (other nomenclature, `dupT` vs `dup`, protein-only titles) and false positives (same cDNA on another transcript).

@@ -30,6 +30,18 @@ def synthesize(ctx: CaseContext, llm: Any, items: list[ActionItem], ledger: Evid
     for line in s.summary_lines:
         line.text = _strip_unknown(line.text, ledger)
         line.item_ids = [x for x in line.item_ids if x in ids]
+    # exactly one line per tier (the first one wins); a missing tier gets a deterministic fallback
+    seen, lines = set(), []
+    for line in s.summary_lines:
+        if line.tier not in seen:
+            seen.add(line.tier)
+            lines.append(line)
+    for t in (1, 2, 3):
+        if t not in seen:
+            from ..schemas import SummaryLine
+
+            lines.append(SummaryLine(tier=t, text="", item_ids=[]))
+    s.summary_lines = sorted(lines, key=lambda l: l.tier)
     s.missing_information = [_strip_unknown(m, ledger) for m in s.missing_information]
     s.outcome_measures = [om for om in s.outcome_measures if om.item_id in tier3]
     for k, om in enumerate(sorted(s.outcome_measures, key=lambda o: o.rank), start=1):
@@ -78,3 +90,76 @@ def apply_revisions(items: list[ActionItem], plan: RevisionPlan, ledger: Evidenc
 def judge(ctx: CaseContext, llm: Any, markdown: str, ledger: EvidenceLedger) -> JudgeReport:
     system = prompts.render("judge", PATIENT=ctx.patient_json(), REPORT=markdown, EVIDENCE=ledger.digest(max_chars_per_record=300, max_total=30000))
     return llm.structured(stage="Z_judge", system=system, user="Score the report.", output_model=JudgeReport)
+
+
+# ---------------------------------------------------------------- B2: verify the synthesis
+TIER_OF = {Section.EXISTING_TARGETED: 1, Section.SUPPORTIVE: 1, Section.CONTRAINDICATIONS: 1, Section.TRIALS: 2, Section.OFF_LABEL: 2,
+           Section.BESPOKE: 3, Section.REPURPOSING: 3}
+
+
+def fallback_summary(tier: int, items: list[ActionItem]) -> str:
+    """Deterministic summary line that adds no new clinical assertion: points to the top verified item of the tier."""
+    from ..template import SECTION_HEADING
+
+    its = sorted([i for i in items if TIER_OF[i.section] == tier], key=lambda i: (i.priority, i.item_id))
+    if not its:
+        return "No qualifying action was identified at this tier in this run."
+    top = its[0]
+    return f"{top.title.strip().rstrip(':')} — see {SECTION_HEADING[top.section]} below."
+
+
+def verify_synthesis(s: Synthesis, items: list[ActionItem], ledger: EvidenceLedger, verifier_llm: Any, effort: str):
+    """Every model-written synthesis text is checked deterministically and then by the verifier.
+    Failed or undecided texts are replaced by deterministic fallbacks (summary) or removed (missing information,
+    outcome measures). Returns (synthesis, coverage, events)."""
+    from ..rules import item_citations
+    from .verifier import verify_payload
+
+    by_id = {i.item_id: i for i in items}
+    events: list[dict[str, Any]] = []
+    payload: list[dict[str, Any]] = []
+    lines = {}
+    for line in s.summary_lines:
+        refs = [by_id[x] for x in line.item_ids if x in by_id and TIER_OF[by_id[x].section] == line.tier]
+        allowed = {k for r in refs for k in item_citations(r)}
+        cited = set(re.findall(r"\[([A-Z][A-Za-z]+:[^\]\s]+|NCT\d{8})\]", line.text))
+        if not refs or not cited <= allowed:
+            events.append({"target": f"summary-{line.tier}", "action": "fallback", "reason": "not linked to verified items of this tier / foreign citation"})
+            line.text, line.item_ids = fallback_summary(line.tier, items), []
+            continue
+        lines[f"SYN-summary-{line.tier}"] = line
+        payload.append({"item_id": f"SYN-summary-{line.tier}", "claim_index": 0, "section": "summary", "item_title": "summary",
+                        "claim": line.text, "kind": "summary_of_verified_items", "citations": sorted(allowed)})
+    all_keys = sorted({k for i in items for k in item_citations(i)})
+    for n, m in enumerate(s.missing_information):
+        payload.append({"item_id": f"SYN-missing-{n}", "claim_index": 0, "section": "summary", "item_title": "missing information",
+                        "claim": m, "kind": "conditional_action", "citations": all_keys[:20]})
+    for om in s.outcome_measures:
+        it = by_id.get(om.item_id)
+        cites = sorted(set(om.citations) | (set(item_citations(it)) if it else set()))
+        payload.append({"item_id": f"SYN-om-{om.item_id}", "claim_index": 0, "section": "outcome_measures", "item_title": om.action_name,
+                        "claim": f"Ranking rationale: {om.rank_rationale} Safety metrics: {om.safety_metrics} Efficacy metrics: {om.efficacy_metrics} "
+                                 f"Preclinical testing: {om.preclinical_testing}", "kind": "outcome_measure", "citations": cites})
+    vr = verify_payload(payload, ledger, verifier_llm, effort, "D_verify_synth") if payload else None
+    ok = {v.item_id for v in (vr.verdicts if vr else []) if v.verdict in ("supported", "not_checkable")}
+    for sid, line in lines.items():
+        if sid not in ok:
+            events.append({"target": sid, "action": "fallback", "reason": "summary line not verified"})
+            line.text, line.item_ids = fallback_summary(line.tier, items), []
+    kept_missing = []
+    for n, m in enumerate(s.missing_information):
+        if f"SYN-missing-{n}" in ok:
+            kept_missing.append(m)
+        else:
+            events.append({"target": f"SYN-missing-{n}", "action": "removed", "reason": "conditional action not verified"})
+    s.missing_information = kept_missing
+    kept_om = []
+    for om in s.outcome_measures:
+        if f"SYN-om-{om.item_id}" in ok:
+            kept_om.append(om)
+        else:
+            events.append({"target": f"SYN-om-{om.item_id}", "action": "removed", "reason": "outcome measure not verified"})
+    for k, om in enumerate(sorted(kept_om, key=lambda o: o.rank), start=1):
+        om.rank = k
+    s.outcome_measures = kept_om
+    return s, (vr.coverage if vr else {"expected": 0, "missing_after_reverification": []}), events

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 from .. import prompts
@@ -52,16 +53,17 @@ def deterministic_checks(items: list[ActionItem], ledger: EvidenceLedger, http: 
                 st = clinicaltrials.trial_status(http, k)
             except Exception as e:  # pragma: no cover
                 st = {"exists": None, "error": str(e)}
-            report["trials"][k] = st
+            report["trials"][k] = {x: y for x, y in st.items() if x != "record"}
             rec = ledger.get(k)
-            if rec and st.get("exists"):
-                rec.metadata["overall_status"] = st["status"]
-                rec.metadata["status"] = st["status"]
-                rec.metadata["status_checked_at"] = st.get("checked_at")
-                rec.verified_exists = True
+            if st.get("exists"):
+                # overwrite status, ages, sex and eligibility text with the live record (no stale values survive)
+                clinicaltrials.refresh_record(ledger, st["record"], st.get("checked_at", ""))
             elif rec and st.get("exists") is False:
                 rec.verified_exists = False
                 rec.metadata["overall_status"] = "NOT_FOUND"
+                rec.metadata["status_verification"] = "not_found"
+            elif rec:  # live check FAILED: current status is unverified, not absent
+                rec.metadata["status_verification"] = "failed"
     return report
 
 
@@ -96,17 +98,68 @@ def _sources_text(keys: list[str], ledger: EvidenceLedger, per: int = 3500, tota
     return "\n\n".join(parts)
 
 
-def llm_verify(items: list[ActionItem], ledger: EvidenceLedger, llm: Any, effort: str, batch_size: int = 18,
-               statements_only: bool = False) -> list[ClaimVerdict]:
-    claims = _claims_payload(items, statements_only)
-    verdicts: list[ClaimVerdict] = []
-    for b in range(0, len(claims), batch_size):
-        batch = claims[b : b + batch_size]
+SEVERITY = {"contradicted": 4, "unsupported": 3, "partially_supported": 2, "not_checkable": 1, "supported": 0}
+
+
+@dataclass
+class VerificationResult:
+    verdicts: list[ClaimVerdict]
+    coverage: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def complete(self) -> bool:
+        return not self.coverage.get("missing_after_reverification")
+
+
+def _collect(out: VerificationBatch, expected: set[tuple[str, int]], got: dict, cov: dict) -> None:
+    for v in out.verdicts:
+        key = (v.item_id, v.claim_index)
+        if key not in expected:
+            cov["malformed_or_unexpected"] += 1
+            continue
+        prev = got.get(key)
+        if prev is None:
+            got[key] = v
+        elif prev.verdict != v.verdict:
+            cov["conflicting_duplicates"].append(list(key))
+            if SEVERITY[v.verdict] > SEVERITY[prev.verdict]:  # keep the most conservative decision
+                got[key] = v
+        else:
+            cov["identical_duplicates"] += 1
+
+
+def verify_payload(claims: list[dict[str, Any]], ledger: EvidenceLedger, llm: Any, effort: str, stage: str,
+                   batch_size: int = 18) -> VerificationResult:
+    """Verify claim payloads; every expected (item_id, claim_index) must receive exactly one decision.
+
+    Missing decisions trigger ONE bounded re-verification of only the missing claims; whatever is still missing
+    is reported in coverage and treated as unverified (fail closed) by the rules."""
+    expected = {(c["item_id"], c["claim_index"]) for c in claims}
+    got: dict[tuple[str, int], ClaimVerdict] = {}
+    cov: dict[str, Any] = {"expected": len(expected), "conflicting_duplicates": [], "identical_duplicates": 0, "malformed_or_unexpected": 0,
+                           "reverified": 0, "missing_after_reverification": []}
+
+    def run(batch: list[dict[str, Any]], tag: str) -> None:
         keys = list(dict.fromkeys(k for c in batch for k in c["citations"]))
         system = prompts.render("verifier", CLAIMS=json.dumps(batch, indent=1), SOURCES=_sources_text(keys, ledger))
-        out = llm.structured(stage=f"D_verify:b{b // batch_size}", system=system,
-                             user="Verify every claim listed. Return one verdict per (item_id, claim_index).",
+        out = llm.structured(stage=f"{stage}:{tag}", system=system,
+                             user="Verify every claim listed. Return exactly one verdict per (item_id, claim_index).",
                              output_model=VerificationBatch, effort=effort)
-        valid = {(c["item_id"], c["claim_index"]) for c in batch}
-        verdicts += [v for v in out.verdicts if (v.item_id, v.claim_index) in valid]
-    return verdicts
+        _collect(out, {(c["item_id"], c["claim_index"]) for c in batch}, got, cov)
+
+    for b in range(0, len(claims), batch_size):
+        run(claims[b : b + batch_size], f"b{b // batch_size}")
+    missing = [c for c in claims if (c["item_id"], c["claim_index"]) not in got]
+    if missing:
+        cov["reverified"] = len(missing)
+        for b in range(0, len(missing), batch_size):
+            run(missing[b : b + batch_size], f"retry{b // batch_size}")
+    cov["missing_after_reverification"] = [[c["item_id"], c["claim_index"]] for c in claims if (c["item_id"], c["claim_index"]) not in got]
+    cov["received"] = len(got)
+    order = {k: i for i, k in enumerate((c["item_id"], c["claim_index"]) for c in claims)}
+    return VerificationResult(sorted(got.values(), key=lambda v: order[(v.item_id, v.claim_index)]), cov)
+
+
+def llm_verify(items: list[ActionItem], ledger: EvidenceLedger, llm: Any, effort: str, batch_size: int = 18,
+               statements_only: bool = False) -> VerificationResult:
+    return verify_payload(_claims_payload(items, statements_only), ledger, llm, effort, "D_verify", batch_size)

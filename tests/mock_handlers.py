@@ -23,6 +23,8 @@ def item(item_id, section, title, statement, claims, level="guideline_or_expert_
 
 def interpret(ctx):
     return Interpretation(
+        diagnoses=[{"disease_name": "GENEX-related epilepsy", "inheritance": "autosomal dominant", "variant_hgvs": ["NM_999999.1:c.100G>A"],
+                    "genotype_consistency": "consistent"}],
         disease_name="GENEX-related epilepsy", disease_identifiers=[], inheritance="autosomal dominant", genotype_consistency="consistent",
         variants=[VariantInterpretation(gene="GENEX", hgvs_c="c.100G>A", hgvs_p="p.Asp34Asn", consequence="missense", variant_specific_evidence="ClinVar pathogenic [CLINVAR:VCV000000123]",
                                         gene_level_mechanism="loss of function", variant_mechanism_assessment="uncertain", mechanism_label="uncertain",

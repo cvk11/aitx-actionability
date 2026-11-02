@@ -57,8 +57,12 @@ def ensembl_vep(http: HttpClient, transcript: str, hgvs_c: str) -> dict[str, Any
         return {"ok": False, "error": "empty"}
     v = d[0]
     tcs = v.get("transcript_consequences", [])
-    base = transcript.split(".")[0]
-    match = next((t for t in tcs if t.get("transcript_id", "").split(".")[0] == base), tcs[0] if tcs else {})
+    # never attribute another transcript's consequence to the patient's transcript
+    match = next((t for t in tcs if t.get("transcript_id", "") == transcript), None)
+    if match is None:
+        same_acc = [t.get("transcript_id") for t in tcs if t.get("transcript_id", "").split(".")[0] == transcript.split(".")[0]]
+        return {"ok": False, "error": f"VEP returned no consequence for the requested transcript {transcript}"
+                                      + (f" (only other versions: {same_acc})" if same_acc else f" (returned: {[t.get('transcript_id') for t in tcs][:5]})")}
     colocated = []
     for cv in v.get("colocated_variants", []) or []:
         if cv.get("somatic"):

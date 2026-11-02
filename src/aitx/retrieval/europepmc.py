@@ -12,8 +12,10 @@ from ..ledger import EvidenceLedger, EvidenceRecord
 BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 
 
-def europepmc_search(http: HttpClient, ledger: EvidenceLedger, query: str, max_results: int = 20) -> dict[str, Any]:
-    r = http.request("GET", f"{BASE}/search", params={"query": query, "format": "json", "pageSize": max(1, min(int(max_results), 50)), "resultType": "lite"})
+def europepmc_search(http: HttpClient, ledger: EvidenceLedger, query: str, max_results: int = 20, page: int = 1) -> dict[str, Any]:
+    size = max(1, min(int(max_results), 50))
+    page = max(1, int(page or 1))
+    r = http.request("GET", f"{BASE}/search", params={"query": query, "format": "json", "pageSize": size, "page": page, "resultType": "lite"})
     if r.status != 200:
         return {"error": f"HTTP {r.status}"}
     d = r.json()
@@ -29,8 +31,9 @@ def europepmc_search(http: HttpClient, ledger: EvidenceLedger, query: str, max_r
                                             "preprint": src == "PPR", "open_access": x.get("isOpenAccess") == "Y"}))
         out.append({"key": key, "title": x.get("title"), "year": x.get("pubYear"), "journal": x.get("journalTitle"), "pmcid": pmcid,
                     "open_access": x.get("isOpenAccess") == "Y", "preprint": src == "PPR"})
-    ledger.log_query("europepmc_search", {"query": query}, [o["key"] for o in out])
-    return {"query": query, "hit_count": d.get("hitCount"), "results": out,
+    hits = int(d.get("hitCount") or 0)
+    ledger.log_query("europepmc_search", {"query": query, "page": page}, [o["key"] for o in out], total=max(0, hits - (page - 1) * size))
+    return {"query": query, "page": page, "hit_count": hits, "more_pages": page * size < hits, "results": out,
             "note": "Preprints (preprint=true) are not peer reviewed. Fetch abstracts/full text before citing."}
 
 

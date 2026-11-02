@@ -42,7 +42,24 @@ SOURCE_NAMES = {
 }
 
 
+_MD_LINK = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+_BARE_URL = re.compile(r"(?<![(\[])\bhttps?://[^\s)\]]+")
+
+
+def sanitize_model_text(text: str, ledger: EvidenceLedger) -> str:
+    """Remove links/URLs written by a model unless they point to a ledger record (keeps the link label only)."""
+    known = {r.url for r in ledger.records()}
+
+    def md(m: re.Match) -> str:
+        return m.group(0) if m.group(2) in known else m.group(1)
+
+    text = _MD_LINK.sub(md, text)
+    return _BARE_URL.sub(lambda m: m.group(0) if m.group(0) in known else "", text)
+
+
 def link_citations(text: str, ledger: EvidenceLedger) -> str:
+    text = sanitize_model_text(text, ledger)
+
     def sub(m: re.Match) -> str:
         r = ledger.get(normalize_key(m.group(1)))
         if r is None:
@@ -76,11 +93,22 @@ def render_item(item: ActionItem, ledger: EvidenceLedger, accessed: dict[str, st
     src = _sources_line(item, ledger)
     title = item.title.strip().rstrip(":")
     if item.section == Section.TRIALS:
+        from .retrieval.clinicaltrials import STATUS_LABEL, status_class
+
         rec = ledger.get(item.nct_id)
         status = (rec.metadata.get("overall_status") if rec else "") or "unknown"
         date = (rec.accessed_at[:10] if rec else accessed.get("trials", ""))
-        head = f"- **[{item.nct_id}: {rec.title if rec else title}](https://clinicaltrials.gov/study/{item.nct_id})**:"
-        parts = [f" Status: {status.replace('_', ' ').lower()} (ClinicalTrials.gov, checked {date}).", f" {stmt}"]
+        label = STATUS_LABEL.get(status_class(status), status.replace("_", " ").lower())
+        verification = (rec.metadata.get("status_verification") if rec else "") or ""
+        check = (f"live status re-checked {rec.metadata.get('status_checked_at', '')[:10]}" if verification == "live_ok"
+                 else "LIVE RE-CHECK FAILED — current status unverified" if verification == "failed"
+                 else f"ClinicalTrials.gov record retrieved {date}")
+        if rec is not None:
+            head = f"- **[{item.nct_id}: {sanitize_model_text(rec.title, ledger)}]({rec.url})**:"
+        else:  # never link a registry record that was not retrieved in this run
+            head = f"- **{item.nct_id}: {sanitize_model_text(title, ledger)}** (registry record not retrieved in this run):"
+            check = "not verified"
+        parts = [f" Status: {label} ({check}).", f" {stmt}"]
         if item.criteria_met:
             parts.append(" Criteria met on available data: " + "; ".join(item.criteria_met) + ".")
         if item.criteria_unassessable:
@@ -96,9 +124,27 @@ def render_item(item: ActionItem, ledger: EvidenceLedger, accessed: dict[str, st
         prec_txt = f" Human treatment precedent: {_ensure_period(link_citations(prec, ledger))}" if prec else ""
         return f"- **{title}:** {stmt}{prec_txt}{cond}{ev}{src}"
     if item.section == Section.REPURPOSING:
-        tail = "" if re.search(r"no human (treatment )?precedent", stmt, re.I) else " No human treatment precedent exists in this context."
+        tail = "" if re.search(r"human (treatment )?precedent", stmt, re.I) else " " + precedent_scope(ledger)
         return f"- **{title}:** {stmt}{tail}{cond}{ev}{src}"
     return f"- **{title}:** {stmt}{cond}{ev}{src}"
+
+
+def precedent_scope(ledger: EvidenceLedger) -> str:
+    """Search-scoped, dated statement about human treatment precedent. Never asserts biological absence."""
+    qs = ledger.searches_for("pubmed_search", "europepmc_search")
+    ok = [q for q in qs if not q.error]
+    if not qs:
+        return "Human treatment precedent was not specifically searched in this run."
+    if not ok:
+        return "Human treatment precedent could not be assessed because literature retrieval failed in this run."
+    srcs = ", ".join(sorted({SOURCE_NAMES.get(q.tool, q.tool) for q in ok}))
+    date = max(q.timestamp[:10] for q in ok)
+    trunc = [q for q in ok if q.total_available is not None and q.total_available > q.n_results]
+    cover = (f"; {len(trunc)} of {len(ok)} queries returned more hits than were reviewed (only the first "
+             f"{min(q.n_results for q in trunc)}-{max(q.n_results for q in trunc)} ranked results per query)" if trunc else "")
+    failed = " Some literature queries failed." if len(ok) < len(qs) else ""
+    return (f"No human treatment precedent in this gene/disease/variant context was identified in the literature searched in this run "
+            f"({srcs}, accessed {date}{cover}); this does not establish that none exists.{failed}")
 
 
 def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dict[Section, list[str]]) -> str:
@@ -126,7 +172,9 @@ def _negative_statement(section: Section, ledger: EvidenceLedger, negatives: dic
         Section.BESPOKE: "No DNA- or RNA-directed strategy could be assessed with sufficient evidence in this run.",
         Section.REPURPOSING: "No repurposing candidate with an adequate mechanistic rationale was identified.",
     }[section]
-    searched = (f" Searched: {', '.join(srcs)} (accessed {date}); absence from these sources does not establish that none exists." if srcs else "")
+    trunc = any(q.total_available is not None and q.total_available > q.n_results for q in ok_q)
+    searched = (f" Searched: {', '.join(srcs)} (accessed {date})" + ("; at least one search reviewed only the first page of a larger result set" if trunc else "")
+                + "; absence from these sources does not establish that none exists." if srcs else "")
     fail = f" Retrieval from {', '.join(failed)} failed during this run, so no conclusion can be drawn from that source." if failed else ""
     if not srcs and not failed:
         searched = " No dedicated search was recorded for this section in this run."

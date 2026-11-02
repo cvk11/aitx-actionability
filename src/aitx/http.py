@@ -90,6 +90,7 @@ class HTTPResult:
     text: str
     fetched_at: str
     from_cache: bool
+    location: str = ""  # redirect target when follow_redirects=False
 
     def json(self) -> Any:
         return json.loads(self.text)
@@ -160,6 +161,7 @@ class HttpClient:
         headers: dict[str, str] | None = None,
         use_cache: bool = True,
         ok_statuses: tuple[int, ...] = (200,),
+        follow_redirects: bool = True,
     ) -> HTTPResult:
         host = urlparse(url).netloc
         params = dict(params or {})
@@ -172,13 +174,13 @@ class HttpClient:
         # cache key excludes credentials
         key_params = {k: v for k, v in params.items() if k not in ("api_key", "email")}
         key = hashlib.sha256(
-            json.dumps([method, url, sorted(key_params.items()), json_body], sort_keys=True, default=str).encode()
+            json.dumps([method, url, sorted(key_params.items()), json_body, follow_redirects], sort_keys=True, default=str).encode()
         ).hexdigest()
         if use_cache:
             cached = self._cache_get(key, host)
             if cached is not None:
                 return cached
-        r = self._do(method, url, params, json_body, headers, host, ok_statuses)
+        r = self._do(method, url, params, json_body, headers, host, ok_statuses, follow_redirects)
         if use_cache:
             self._cache_put(key, r)
         return r
@@ -189,15 +191,17 @@ class HttpClient:
         wait=wait_exponential_jitter(initial=1.0, max=20.0),
         reraise=True,
     )
-    def _do(self, method, url, params, json_body, headers, host, ok_statuses) -> HTTPResult:
+    def _do(self, method, url, params, json_body, headers, host, ok_statuses, follow_redirects=True) -> HTTPResult:
         self._limiter.wait(host, self._rates.get(host, 3.0))
         self.request_count += 1
-        resp = self._client.request(method, url, params=params or None, json=json_body, headers=headers)
+        resp = self._client.request(method, url, params=params or None, json=json_body, headers=headers, follow_redirects=follow_redirects)
         if resp.status_code == 429 or resp.status_code >= 500:
             raise RetryableHTTPError(f"{resp.status_code} from {host}")
         fetched = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         public_url = str(resp.request.url.copy_remove_param("api_key").copy_remove_param("email"))
-        return HTTPResult(public_url, resp.status_code, resp.text, fetched, False)
+        out = HTTPResult(public_url, resp.status_code, resp.text, fetched, False)
+        out.location = resp.headers.get("location", "")
+        return out
 
     def get_json(self, url: str, **kw) -> Any:
         r = self.request("GET", url, **kw)

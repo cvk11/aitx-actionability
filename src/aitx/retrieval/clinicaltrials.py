@@ -65,30 +65,72 @@ def _flatten(study: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _register(ledger: EvidenceLedger, f: dict[str, Any], fetched_at: str, tool: str) -> None:
-    content = (
+STATUS_CLASS = {
+    "RECRUITING": "actively_recruiting",
+    "NOT_YET_RECRUITING": "not_yet_recruiting",
+    "ENROLLING_BY_INVITATION": "enrolling_by_invitation",
+    "AVAILABLE": "expanded_access_available",
+}
+STATUS_LABEL = {
+    "actively_recruiting": "actively recruiting",
+    "not_yet_recruiting": "not yet recruiting — not currently enrolling",
+    "enrolling_by_invitation": "enrolling by invitation only — not open recruitment",
+    "expanded_access_available": "expanded access available — not a clinical trial",
+}
+
+
+def status_class(status: str | None) -> str:
+    """Map a ClinicalTrials.gov overall status to the categories the report must keep distinct."""
+    return STATUS_CLASS.get((status or "").upper(), "closed_or_unknown")
+
+
+def _content(f: dict[str, Any]) -> str:
+    return (
         f"{f['title']}. Status: {f['overall_status']} (verified {f['status_verified']}; last update {f['last_update']}). "
         f"Type: {f['study_type']} {', '.join(f['phases'] or [])}. Conditions: {', '.join(f['conditions'])}. "
         f"Interventions: {'; '.join(f['interventions'])}. Ages: {f['min_age']} to {f['max_age']}; sex: {f['sex']}. "
         f"Countries: {', '.join(f['countries'])}. Sponsor: {f['sponsor']}.\nSummary: {f['brief_summary'][:1200]}\n"
         f"Eligibility:\n{f['eligibility_criteria'][:5000]}"
     )
+
+
+META_FIELDS = ("overall_status", "status_verified", "last_update", "min_age_years", "max_age_years", "sex",
+               "study_type", "phases", "countries", "conditions", "interventions", "has_expanded_access")
+
+
+def _register(ledger: EvidenceLedger, f: dict[str, Any], fetched_at: str, tool: str) -> None:
+    content = _content(f)
     rec = ledger.add(EvidenceRecord(
         key=f["nct_id"], source_type="clinicaltrials", title=f["title"] or f["nct_id"],
         url=f"https://clinicaltrials.gov/study/{f['nct_id']}", content=content, content_scope="structured_record",
         retrieved_by=tool, accessed_at=fetched_at,
-        metadata={k: f[k] for k in ("overall_status", "status_verified", "last_update", "min_age_years", "max_age_years", "sex",
-                                     "study_type", "phases", "countries", "conditions", "interventions", "has_expanded_access")}
-        | {"status": f["overall_status"]},
+        metadata={k: f[k] for k in META_FIELDS} | {"status": f["overall_status"], "status_class": status_class(f["overall_status"])},
     ))
+    rec.verified_exists = True
+
+
+def refresh_record(ledger: EvidenceLedger, f: dict[str, Any], fetched_at: str) -> None:
+    """Overwrite (not merge) a trial record with live data, so stale ages/sex/eligibility can never survive."""
+    rec = ledger.get(f["nct_id"])
+    if rec is None:
+        _register(ledger, f, fetched_at, "trial_status")
+        rec = ledger.get(f["nct_id"])
+    for k in META_FIELDS:
+        rec.metadata[k] = f[k]
+    rec.metadata.update({"status": f["overall_status"], "status_class": status_class(f["overall_status"]),
+                         "status_checked_at": fetched_at, "status_verification": "live_ok"})
+    rec.content = _content(f)
+    rec.accessed_at = fetched_at
     rec.verified_exists = True
 
 
 def search_trials(
     http: HttpClient, ledger: EvidenceLedger, condition: str = "", term: str = "", intervention: str = "",
-    open_only: bool = True, page_size: int = 25,
+    open_only: bool = True, page_size: int = 25, page_token: str = "",
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"fields": FIELDS, "pageSize": max(1, min(int(page_size), 50)), "countTotal": "true", "format": "json"}
+    if page_token:
+        params["pageToken"] = page_token
     if condition:
         params["query.cond"] = condition
     if term:
@@ -107,14 +149,17 @@ def search_trials(
         f = _flatten(s)
         _register(ledger, f, r.fetched_at, "search_trials")
         row = {k: f[k] for k in ("nct_id", "title", "overall_status", "study_type", "phases", "min_age", "max_age")}
+        row["status_class"] = status_class(f["overall_status"])
         row["conditions"] = f["conditions"][:6] + ([f"... +{len(f['conditions']) - 6} more"] if len(f["conditions"]) > 6 else [])
         row["interventions"] = f["interventions"][:5]
         row["countries"] = f["countries"][:8] + (["..."] if len(f["countries"]) > 8 else [])
         out.append(row)
-    ledger.log_query("search_trials", {"condition": condition, "term": term, "intervention": intervention, "open_only": open_only},
-                     [o["nct_id"] for o in out])
-    return {"total_count": d.get("totalCount"), "studies": out, "accessed_at": r.fetched_at,
-            "note": "Use get_trial for full eligibility criteria before asserting eligibility."}
+    total = d.get("totalCount")
+    ledger.log_query("search_trials", {"condition": condition, "term": term, "intervention": intervention, "open_only": open_only,
+                                       "page_token": page_token}, [o["nct_id"] for o in out], total=total if page_token == "" else None)
+    return {"total_count": total, "studies": out, "next_page_token": d.get("nextPageToken", ""), "accessed_at": r.fetched_at,
+            "note": "Use get_trial for full eligibility criteria before asserting eligibility. Pass next_page_token to review more studies. "
+                    "status_class distinguishes actively_recruiting / not_yet_recruiting / enrolling_by_invitation / expanded_access_available."}
 
 
 def get_trial(http: HttpClient, ledger: EvidenceLedger, nct_id: str) -> dict[str, Any]:
@@ -134,10 +179,20 @@ def get_trial(http: HttpClient, ledger: EvidenceLedger, nct_id: str) -> dict[str
 
 
 def trial_status(http: HttpClient, nct_id: str) -> dict[str, Any]:
-    """Live status check used by the deterministic verifier (bypasses cache)."""
-    r = http.request("GET", f"{BASE}/{nct_id}", params={"format": "json", "fields": FIELDS}, use_cache=False)
+    """Live re-check used by the deterministic verifier (bypasses cache).
+
+    exists=True  -> live record returned (with current status, ages, sex, eligibility text in `record`)
+    exists=False -> ClinicalTrials.gov answered 404 (record not found)
+    exists=None  -> the check FAILED (other HTTP status / network error): current status is UNVERIFIED
+    """
+    try:
+        r = http.request("GET", f"{BASE}/{nct_id}", params={"format": "json", "fields": FIELDS}, use_cache=False, ok_statuses=(200, 404))
+    except Exception as e:  # network failure after retries
+        return {"exists": None, "status": None, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    if r.status == 404:
+        return {"exists": False, "status": None, "http": 404}
     if r.status != 200:
-        return {"exists": False, "status": None, "http": r.status}
+        return {"exists": None, "status": None, "http": r.status}
     f = _flatten(r.json())
-    return {"exists": True, "status": f["overall_status"], "min_age_years": f["min_age_years"], "max_age_years": f["max_age_years"],
-            "sex": f["sex"], "checked_at": r.fetched_at, "title": f["title"]}
+    return {"exists": True, "status": f["overall_status"], "status_class": status_class(f["overall_status"]), "min_age_years": f["min_age_years"],
+            "max_age_years": f["max_age_years"], "sex": f["sex"], "checked_at": r.fetched_at, "title": f["title"], "record": f}
