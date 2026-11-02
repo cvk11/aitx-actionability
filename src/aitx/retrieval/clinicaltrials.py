@@ -30,6 +30,19 @@ def _age_to_years(s: str | None) -> float | None:
     return round(n * f, 4)
 
 
+# Headings that split an eligibility text into arm- or cohort-specific blocks. Criteria under one heading do NOT
+# apply to the other arms: a healthy-volunteer requirement is not a patient-eligibility requirement.
+ARM_HEADING = re.compile(
+    r"^[\s*\-\u2022]*((?:healthy[ _-]?volunteers?|healthy[ _-]?controls?|control[ _-]?group|"
+    r"(?:group|arm|cohort|part|phase)\s+[A-Za-z0-9]+|for (?:patients?|participants?|subjects?) with [^\n:]{3,60}))\s*:?\s*$",
+    re.I | re.M)
+
+
+def arm_headings(text: str) -> list[str]:
+    """Arm/cohort headings found in an eligibility text, in order of appearance."""
+    return [m.group(1).strip() for m in ARM_HEADING.finditer(text or "")]
+
+
 def _flatten(study: dict[str, Any]) -> dict[str, Any]:
     ps = study.get("protocolSection", {})
     idm, st, de = ps.get("identificationModule", {}), ps.get("statusModule", {}), ps.get("designModule", {})
@@ -55,7 +68,9 @@ def _flatten(study: dict[str, Any]) -> dict[str, Any]:
         "min_age_years": _age_to_years(el.get("minimumAge")),
         "max_age_years": _age_to_years(el.get("maximumAge")),
         "sex": el.get("sex"),
+        "healthy_volunteers": el.get("healthyVolunteers"),
         "eligibility_criteria": el.get("eligibilityCriteria", ""),
+        "eligibility_arm_headings": arm_headings(el.get("eligibilityCriteria", "")),
         "countries": countries,
         "n_sites": len(locs),
         "recruiting_sites": sum(1 for l in locs if l.get("status") == "RECRUITING"),
@@ -88,14 +103,19 @@ def _content(f: dict[str, Any]) -> str:
     return (
         f"{f['title']}. Status: {f['overall_status']} (verified {f['status_verified']}; last update {f['last_update']}). "
         f"Type: {f['study_type']} {', '.join(f['phases'] or [])}. Conditions: {', '.join(f['conditions'])}. "
-        f"Interventions: {'; '.join(f['interventions'])}. Ages: {f['min_age']} to {f['max_age']}; sex: {f['sex']}. "
+        f"Interventions: {'; '.join(f['interventions'])}. Ages: {f['min_age']} to {f['max_age']}; sex: {f['sex']}; "
+        f"accepts healthy volunteers: {f['healthy_volunteers']}. "
         f"Countries: {', '.join(f['countries'])}. Sponsor: {f['sponsor']}.\nSummary: {f['brief_summary'][:1200]}\n"
-        f"Eligibility:\n{f['eligibility_criteria'][:5000]}"
+        + (f"ARM/COHORT HEADINGS IN THE ELIGIBILITY TEXT: {'; '.join(f['eligibility_arm_headings'])}. Criteria listed under one "
+           f"heading apply ONLY to that arm or cohort; do not apply them to another arm (e.g. healthy-volunteer "
+           f"requirements are not patient-eligibility requirements).\n" if f['eligibility_arm_headings'] else "")
+        + f"Eligibility:\n{f['eligibility_criteria'][:5000]}"
     )
 
 
 META_FIELDS = ("overall_status", "status_verified", "last_update", "min_age_years", "max_age_years", "sex",
-               "study_type", "phases", "countries", "conditions", "interventions", "has_expanded_access")
+               "study_type", "phases", "countries", "conditions", "interventions", "has_expanded_access",
+               "healthy_volunteers", "eligibility_arm_headings")
 
 
 def _register(ledger: EvidenceLedger, f: dict[str, Any], fetched_at: str, tool: str) -> None:

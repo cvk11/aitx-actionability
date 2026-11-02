@@ -38,11 +38,16 @@ def test_template_headings_match_official_file():
 
 # ---------------------------------------------------------------- anti-hardcoding
 def test_no_official_case_specifics_in_code_or_prompts(official_cases):
+    from aitx.evidence import variant_notations
+
     banned = set()
     for c in official_cases:
         banned.add(c["id"])
         for v in c["patient"]["genotype"]:
             banned |= {v["gene"], v["transcript"], v["variant_cdna"]}
+            # also every spelling of the variant (p.Asp34Asn, Asp34Asn, D34N, ...): a short protein notation is
+            # case content too, and tuning production code or prompts to it would be case-specific tuning
+            banned |= variant_notations(v["variant_cdna"], v["variant_protein"])
     files = list((ROOT / "src").rglob("*.py")) + list((ROOT / "prompts").glob("*.md")) + [ROOT / "deployment" / "app.py"]
     for f in files:
         if not f.exists():

@@ -28,6 +28,14 @@ TIER3 = {Section.BESPOKE, Section.REPURPOSING}
 OVERCLAIM = re.compile(r"\b(will|would)\s+(improve|benefit|respond|help|work|be effective)|\bis (effective|beneficial) (for|in) (this|the) patient|"
                        r"\bproven (to|effective)|\bestablished (benefit|efficacy)|\bcures?\b|\bguarantee", re.I)
 THIS_VARIANT = re.compile(r"\b(this|the patient'?s|the index) variant\b", re.I)
+# Interventions whose rationale depends on the DIRECTION of the variant's functional effect: a potentiator is only
+# rational for reduced function and an inhibitor only for increased function. Proposing one commits to a GoF/LoF
+# assumption, so the item must rest on evidence about this variant or this variant's established mechanism.
+DIRECTIONAL = re.compile(
+    r"\b(potentiat\w*|activat\w*|agonist\w*|positive modulat\w*|enhanc\w*|"
+    r"inhibit\w*|antagonist\w*|blocker\w*|negative modulat\w*|suppress\w*|"
+    r"knock[- ]?down|silenc\w*|allele[- ]specific)\b", re.I)
+MECHANISM_APPLICABLE = {"same_variant", "same_gene_same_mechanism"}
 STRENGTH = ["mechanistic_inference", "preclinical_related", "preclinical_same_gene", "human_related_disease_or_mechanism", "human_same_gene",
             "human_same_variant", "guideline_or_expert_review", "regulatory_approval"]
 # claim kinds that carry an item's core assertion: trials/contraindications without a supported core claim are dropped
@@ -187,6 +195,12 @@ def apply_section_rules(items: list[ActionItem], ledger: EvidenceLedger, age_yea
                     res.events.append(RuleEvent(it.item_id, "trial_genotype_ineligible", "dropped", f"{nct} names {sorted(named)[:8]}; patient {genes}"))
                     continue
                 it.criteria_met = list(dict.fromkeys(it.criteria_met + [f"Genetic diagnosis in {', '.join(sorted(named & {g.upper() for g in genes}))} (named in the registry record)"]))
+            arms = rec.metadata.get("eligibility_arm_headings") or []
+            if arms:
+                # criteria under an arm/cohort heading belong to that arm only (e.g. healthy-volunteer requirements)
+                it.criteria_unassessable = list(dict.fromkeys(it.criteria_unassessable + [
+                    f"The registry eligibility text is split by arm/cohort ({', '.join(arms[:4])}); each criterion applies only to its own "
+                    "arm, so arm-specific requirements must be attributed to the correct arm before judging eligibility"]))
             if re.search(r"gain[- ]of[- ]function|loss[- ]of[- ]function|dominant[- ]negative|hypomorph", rec.content or "", re.I):
                 it.criteria_unassessable = list(dict.fromkeys(it.criteria_unassessable + [
                     "The record refers to a variant functional class (gain/loss of function); this variant's class must be confirmed"]))
@@ -295,6 +309,18 @@ def apply_verdicts(items: list[ActionItem], verdicts: list[ClaimVerdict], *, led
             res.problem(it.item_id, f"Full statement {sv.verdict}: {sv.rationale[:250]}. Rewrite it to say only what the cited sources support.")
         if sv is not None and sv.overgeneralization.strip():
             res.problem(it.item_id, f"Overgeneralisation in statement: {sv.overgeneralization[:200]}")
+        # direction-of-effect dependency: a potentiator/inhibitor proposal commits to a functional class for THIS
+        # variant. Unless a verified claim applies to this variant or its established mechanism, the dependency and
+        # the uncertainty must be stated rather than assumed.
+        if it.section in TIER3 and DIRECTIONAL.search(f"{it.title} {it.statement}"):
+            grounded = any(v is not None and v.verdict == "supported" and v.applicability in MECHANISM_APPLICABLE
+                           for _, v in zip(kept, kept_v))
+            if not grounded:
+                res.events.append(RuleEvent(it.item_id, "mechanism_direction_unestablished", "flagged",
+                                            "directional intervention without variant-specific mechanism evidence"))
+                res.problem(it.item_id, "This candidate's rationale depends on the direction of the variant's functional effect "
+                                        "(e.g. potentiation vs inhibition), but no verified claim establishes that direction for this "
+                                        "variant. State the dependency and the uncertainty explicitly, or drop the candidate.")
         if it.section != Section.TRIALS and OVERCLAIM.search(it.statement + " " + it.human_precedent):
             status = "needs_reverification" if status in ("supported", "hypothesis") else status
             res.problem(it.item_id, "Statement predicts benefit for this patient or overstates certainty; report only what the evidence shows "

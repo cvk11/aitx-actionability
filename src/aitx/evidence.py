@@ -56,6 +56,23 @@ def _terms(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9][a-z0-9\-\.>*]{2,}", text.lower()) if w not in STOP}
 
 
+# Passages that qualify, contradict or limit a positive result. Claim-term scoring alone can miss these, because a
+# harm or null finding is often worded with none of the claim's vocabulary ("unaffected littermates showed reduced
+# rotarod latency"). They are reserved a separate budget so a verifier never sees only the supporting half of a source.
+CONTRAST = re.compile(
+    r"\b(no significant|not significant|did not|failed to|without (?:any )?(?:significant |detectable )?(?:effect|benefit|improvement|change)|"
+    r"no (?:significant )?(?:effect|benefit|improvement|difference|change|response)|unchanged|"
+    r"worsen\w*|deteriorat\w*|impair\w*|exacerbat\w*|aggravat\w*|detriment\w*|harm\w*|"
+    r"adverse|toxic\w*|side effects?|mortality|lethal\w*|died|death[s]?|"
+    r"wild[- ]type|wildtype|unaffected (?:littermates?|controls?|mice|animals)|control (?:mice|animals|group)|"
+    r"limitation[s]?|caveat|however|in contrast|conversely|but not|only in|whereas)\b", re.I)
+
+
+def contrast_passages(ps: list[tuple[str, str]]) -> list[int]:
+    """Indices of passages carrying a negative, null, harmful or limiting signal."""
+    return [i for i, (_, t) in enumerate(ps) if CONTRAST.search(t)]
+
+
 def select_passages(rec: EvidenceRecord, query: str, extra_terms: Iterable[str] = (), max_chars: int = 3500) -> tuple[str, dict[str, Any]]:
     """Most relevant passages for `query` (claim text + intervention + variant notations), in document order,
     always including the record head. Returns (text, info) where info states how much was shown."""
@@ -79,8 +96,20 @@ def select_passages(rec: EvidenceRecord, query: str, extra_terms: Iterable[str] 
             continue
         keep.add(i)
         used += len(ps[i][1])
+    # Reserve a separate budget for negative/null/harmful passages, so a source's qualifying evidence is never
+    # dropped merely because it shares no vocabulary with the claim being checked.
+    contrast = contrast_passages(ps)
+    c_used, c_budget = 0, max(600, max_chars // 3)
+    for i in sorted(contrast, key=lambda i: (-scored[i][0], i)):
+        if i in keep:
+            continue
+        if c_used + len(ps[i][1]) > c_budget:
+            continue
+        keep.add(i)
+        c_used += len(ps[i][1])
     text = "\n".join(f"[{ps[i][0]}] {ps[i][1]}" for i in sorted(keep))
-    return text, {"n_passages": len(ps), "shown": len(keep)}
+    return text, {"n_passages": len(ps), "shown": len(keep), "contrast_passages": len(contrast),
+                  "contrast_shown": len([i for i in keep if i in set(contrast)])}
 
 
 # ---------------------------------------------------------------- variant notations

@@ -183,7 +183,7 @@ def _anchor_re(terms: list[str]) -> re.Pattern[str]:
 def variant_context(rec: EvidenceRecord | None, gene_terms: list[str], notations: list[str]) -> dict[str, Any]:
     """Does the accessible text of an article mention the patient's variant IN THE CONTEXT OF THIS GENE?
 
-    A Europe PMC full-text hit only shows that the gene symbol and a notation string (e.g. 'D34N') occur somewhere in
+    A Europe PMC full-text hit only shows that the gene symbol and a variant notation string occur somewhere in
     the article, possibly about another protein. The hit is 'confirmed' only if one passage (paragraph or table row,
     including its table caption) contains both a gene anchor and a variant notation. Otherwise:
     'notation_without_gene_context' (the notation occurs only away from the gene), 'notation_not_in_accessible_text'
@@ -220,7 +220,7 @@ def variant_literature_search(http: HttpClient, ledger: EvidenceLedger, gene: st
 
     Europe PMC hits are then checked for gene context (`variant_context`): only hits whose accessible text mentions the
     variant together with the gene are returned as variant literature; the others are listed under
-    `europepmc_unconfirmed` with the reason (a notation such as 'D34N' can belong to any protein). A failed source is
+    `europepmc_unconfirmed` with the reason (a short notation such as 'R123W' can belong to any protein). A failed source is
     reported in `failures` and the result status is 'partial'/'failed' (never an empty result)."""
     nots = [n for n in dict.fromkeys(notations) if n]
     if not gene or not nots:

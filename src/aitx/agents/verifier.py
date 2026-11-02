@@ -163,7 +163,8 @@ def _evidence_packet(claim: dict[str, Any], ledger: EvidenceLedger, vctx: Verify
         found = mentions_variant(record_text(r), vctx.notations) if vctx.notations else []
         blocks.append(f"=== [{r.key}] {r.title}\nsource_type={r.source_type}; text_scope={r.content_scope}; meta={json.dumps(meta, default=str)[:400]}\n"
                       f"patient_variant_mentioned_in_source={'yes: ' + ', '.join(found) if found else 'no'}; "
-                      f"passages_shown={info['shown']} of {info['n_passages']}\n{text}")
+                      f"passages_shown={info['shown']} of {info['n_passages']}; "
+                      f"negative_or_limiting_passages_shown={info.get('contrast_shown', 0)} of {info.get('contrast_passages', 0)}\n{text}")
     return "\n".join(blocks) if blocks else "(no citation: reasoning claim)"
 
 
