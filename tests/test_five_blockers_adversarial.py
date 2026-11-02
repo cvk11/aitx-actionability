@@ -295,6 +295,8 @@ def test_general_requirements_are_separate_from_arm_specific_requirements():
     ('Inclusion Criteria:\n* pathogenic variant in GENEX\nExclusion Criteria:\n* OTHER1-related disease',True,True),
     ('Arm A:\nInclusion: pathogenic variant in OTHER1.\nArm B:\nInclusion: pathogenic variant in GENEX.',True,False),
     ('Inclusion:\nArm A: pathogenic variant in OTHER1.\nArm B: pathogenic variant in GENEX.',True,False),
+    ('Inclusion: Arm A: pathogenic variant in GENEX. Arm B: pathogenic variant in OTHER1.',True,False),
+    ('Inclusion: Arm A: pathogenic variant in OTHER1. Arm B: all genetically confirmed ataxias.',True,False),
     ('OTHER1-related disease mentioned without criteria scope.',True,False),
     ('',True,False),
     ('Inclusion: GENEX gene testing may be available.',True,False),
@@ -312,6 +314,16 @@ def test_trial_scope_never_transfers_exclusion_or_arm_genes(criteria,keep,met):
         assert any('Genetic diagnosis' in c for c in res.items[0].criteria_met)==met
         if not criteria or 'Arm ' in criteria or 'scope' in criteria:
             assert any('uncertain' in c for c in res.items[0].criteria_unassessable)
+
+
+@pytest.mark.parametrize('label', ['Arm', 'Cohort', 'Group', 'Part'])
+def test_inline_eligibility_blocks_keep_each_cohort_scope(label):
+    raw = f'Inclusion: {label} A: OTHER1-related disease. {label} B: all genetic ataxias. Exclusion: active infection.'
+    blocks = eligibility_blocks(raw)
+    assert [(b['scope'], b['arm']) for b in blocks] == [
+        ('inclusion', f'{label} A'), ('inclusion', f'{label} B'), ('exclusion', f'{label} B')]
+    assert blocks[0]['text'] == 'OTHER1-related disease.'
+    assert blocks[1]['text'] == 'all genetic ataxias.'
 
 
 @pytest.mark.parametrize('metadata,age,sex,keep', [
