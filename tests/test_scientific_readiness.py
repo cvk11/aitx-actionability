@@ -293,7 +293,10 @@ def test_r6_directional_candidate_with_variant_specific_evidence_is_not_flagged(
                [("The patient's variant reduces agonist-induced calcium release.", [SAME_RESIDUE_KEY], "molecular_fact")],
                f"A selective potentiator could compensate for the reduced channel function [{SAME_RESIDUE_KEY}].",
                title="Selective channel potentiator")
-    res = apply_verdicts([it], [_v("m3", 0, app="same_variant", quote="q", key=SAME_RESIDUE_KEY),
+    functional = _v("m3", 0, app="same_variant", quote="q", key=SAME_RESIDUE_KEY).model_copy(update={
+        "functional_evidence": "variant_function", "functional_direction": "loss_of_function",
+        "functional_context": "heterozygous_wild_type_mutant"})
+    res = apply_verdicts([it], [functional,
                                 _v("m3", -1, app="same_variant", quote="q", key=SAME_RESIDUE_KEY)],
                          ledger=_mechanism_ledger())
     assert not any(e.rule == "mechanism_direction_unestablished" for e in res.events)

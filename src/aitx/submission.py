@@ -26,6 +26,26 @@ def assemble_submission(results: list[Any], expected_ids: list[str], *, allow_mo
         # independent completion checks (not only the issue list): a result object that skipped stages,
         # verification or synthesis checking must never be submitted, whatever its blocker list says
         a = r.audit
+        from .schemas import ActionItem
+        from .verification_contract import contract_errors, text_digest
+        final_items = [ActionItem.model_validate(i) for i in a.get("final_items", [])]
+        problems += [f"{r.output.id}: {e}" for e in contract_errors(final_items, a.get("item_contracts", {}))]
+        final_verification = a.get("stages", {}).get("final_item_verification")
+        if final_verification is None:
+            problems.append(f"{r.output.id}: final full-item verification not recorded")
+        else:
+            decisions = {v["item_id"]: v for v in final_verification.get("verdicts", []) if v["claim_index"] == -1}
+            for it in final_items:
+                decision = decisions.get(it.item_id, {})
+                contract = a.get("item_contracts", {}).get(it.item_id, {})
+                allowed = ("supported", "not_checkable") if contract.get("status") == "hypothesis" else ("supported",)
+                if (decision.get("verdict") not in allowed or decision.get("overgeneralization")
+                        or final_verification.get("inputs", {}).get(it.item_id) != contract.get("digest")):
+                    problems.append(f"{r.output.id}: {it.item_id}: final decision does not verify the rendered item")
+            if final_verification.get("coverage", {}).get("missing_after_reverification"):
+                problems.append(f"{r.output.id}: final verification incomplete")
+        if a.get("rendered_sha256") != text_digest(r.output.report_markdown):
+            problems.append(f"{r.output.id}: rendered Markdown changed after final QC")
         if not a.get("stages_completed"):
             problems.append(f"{r.output.id}: mandatory stages not recorded as completed")
         if a.get("mode") == "baseline":

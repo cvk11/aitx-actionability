@@ -79,6 +79,8 @@ def apply_revisions(items: list[ActionItem], plan: RevisionPlan, ledger: Evidenc
             upd["statement"] = _strip_unknown(r.revised_statement, ledger)
         if r.revised_title.strip():
             upd["title"] = r.revised_title.strip()
+        if r.revised_claims:
+            upd["claims"] = r.revised_claims
         if r.action == "move" and r.new_section:
             upd["section"] = Section(r.new_section)
             if upd["section"] == Section.REPURPOSING:

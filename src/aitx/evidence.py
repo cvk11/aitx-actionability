@@ -49,7 +49,26 @@ def passages(rec: EvidenceRecord, chunk: int = 700) -> list[tuple[str, str]]:
                 buf += s + " "
             if buf.strip():
                 out.append((scope, buf.strip()))
-    return out
+    split = []
+    for loc, txt in out:
+        if len(txt) <= chunk:
+            split.append((loc, txt))
+            continue
+        # Exact contiguous source slices, with one preceding sentence of overlap
+        # when it fits. Keep location/character offsets, including table labels.
+        bounds = [0] + [m.end() for m in re.finditer(r"[.!?;]\s+", txt)] + [len(txt)]
+        start = 0
+        while start < len(txt):
+            ends = [b for b in bounds if start < b <= start + chunk]
+            end = max(ends) if ends else min(start + chunk, len(txt))
+            fragment = "; incomplete sentence context" if not ends else ""
+            split.append((f"{loc} (source chars {start}:{end}{fragment})", txt[start:end].strip()))
+            if end == len(txt):
+                break
+            previous = [b for b in bounds if start < b < end]
+            overlap = max(previous) if previous else end
+            start = overlap if end - overlap <= chunk // 3 else end
+    return split
 
 
 def _terms(text: str) -> set[str]:
@@ -64,6 +83,7 @@ CONTRAST = re.compile(
     r"no (?:significant )?(?:effect|benefit|improvement|difference|change|response)|unchanged|"
     r"worsen\w*|deteriorat\w*|impair\w*|exacerbat\w*|aggravat\w*|detriment\w*|harm\w*|"
     r"adverse|toxic\w*|side effects?|mortality|lethal\w*|died|death[s]?|"
+    r"(?:lower|reduced|decreased) survival|survival (?:was |is )?(?:lower|reduced|decreased)|"
     r"wild[- ]type|wildtype|unaffected (?:littermates?|controls?|mice|animals)|control (?:mice|animals|group)|"
     r"limitation[s]?|caveat|however|in contrast|conversely|but not|only in|whereas)\b", re.I)
 
@@ -71,6 +91,16 @@ CONTRAST = re.compile(
 def contrast_passages(ps: list[tuple[str, str]]) -> list[int]:
     """Indices of passages carrying a negative, null, harmful or limiting signal."""
     return [i for i, (_, t) in enumerate(ps) if CONTRAST.search(t)]
+
+
+# Neutral mentions of a wild-type/control group are useful context, but are not
+# by themselves a negative outcome. Prioritize actual limiting results so long
+# Methods sections cannot crowd out harm, and distinguish their omission.
+LIMITING_RESULT = re.compile(
+    r"no significant|not significant|did not|failed to|without (?:any )?(?:effect|benefit|improvement)|"
+    r"no (?:effect|benefit|difference|change|response)|unchanged|worsen\w*|deteriorat\w*|impair\w*|"
+    r"exacerbat\w*|aggravat\w*|detriment\w*|harm\w*|adverse|toxic\w*|mortality|lethal\w*|"
+    r"died|death|atrophy|reduced|decreased|lower survival|survival (?:was )?lower|but not", re.I)
 
 
 def select_passages(rec: EvidenceRecord, query: str, extra_terms: Iterable[str] = (), max_chars: int = 3500) -> tuple[str, dict[str, Any]]:
@@ -85,31 +115,24 @@ def select_passages(rec: EvidenceRecord, query: str, extra_terms: Iterable[str] 
         low = txt.lower()
         s = sum(1 for t in q if t in low) + (3 if any(t in low for t in extra_terms if t) else 0)
         scored.append((s, i))
-    head_loc, head_txt = ps[0]
-    ps[0] = (head_loc, head_txt if len(head_txt) <= 600 else head_txt[:600] + " …")  # head never consumes the budget
-    keep = {0}  # head (title/abstract start or first full-text passage)
-    used = len(ps[0][1])
-    for s, i in sorted(scored, key=lambda x: (-x[0], x[1])):
-        if s <= 0 or i in keep:
-            continue
-        if used + len(ps[i][1]) > max_chars:
-            continue
-        keep.add(i)
-        used += len(ps[i][1])
-    # Reserve a separate budget for negative/null/harmful passages, so a source's qualifying evidence is never
-    # dropped merely because it shares no vocabulary with the claim being checked.
     contrast = contrast_passages(ps)
-    c_used, c_budget = 0, max(600, max_chars // 3)
-    for i in sorted(contrast, key=lambda i: (-scored[i][0], i)):
-        if i in keep:
-            continue
-        if c_used + len(ps[i][1]) > c_budget:
-            continue
-        keep.add(i)
-        c_used += len(ps[i][1])
+    important = {i for i in contrast if LIMITING_RESULT.search(ps[i][1])}
+    keep, used = set(), 0
+    # Contradictory results have first access to the SAME hard budget. Whole
+    # sentence chunks retain neighbouring group/method context and original text.
+    order = sorted(contrast, key=lambda i: (i not in important, -scored[i][0], i)) + [0]
+    order += [i for s, i in sorted(scored, key=lambda x: (-x[0], x[1])) if s > 0]
+    for i in order:
+        size = len(f"[{ps[i][0]}] {ps[i][1]}\n")
+        if i not in keep and used + size <= max_chars:
+            keep.add(i)
+            used += size
     text = "\n".join(f"[{ps[i][0]}] {ps[i][1]}" for i in sorted(keep))
     return text, {"n_passages": len(ps), "shown": len(keep), "contrast_passages": len(contrast),
-                  "contrast_shown": len([i for i in keep if i in set(contrast)])}
+                  "contrast_shown": len([i for i in keep if i in set(contrast)]),
+                  "important_evidence_omitted": len(important - keep),
+                  "incomplete_context": any("incomplete sentence context" in ps[i][0] for i in keep),
+                  "context_limit": len(keep) < len(ps)}
 
 
 # ---------------------------------------------------------------- variant notations
