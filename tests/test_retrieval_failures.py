@@ -388,3 +388,45 @@ def test_pipeline_surfaces_failed_mandatory_coverage(settings, test_case):
     assert rows["human_treatment_reports"]["status"] == "failed"
     assert any(i["code"] == "coverage_query_failed" and "human_treatment_reports" in i["detail"] for i in res.audit["issues"])
     assert seen and "[coverage:GENEX:human_treatment_reports]" in seen[0] and "FAILED" in seen[0]
+
+
+# ------------------------------------------------------------------ 10. Europe PMC upstream 500: actionable failure + short negative cache
+# First real B_full run: the fullTextXML endpoint returned HTTP 500 for specific articles (upstream error, not a
+# 404, not rate limiting); the model re-requested the same articles and burned retry time. The failure must stay a
+# failure (never absence) but repeated requests must fail fast and tell the model what to do instead.
+def _epmc500():
+    return _client([(lambda r: r.url.path.endswith("fullTextXML"), [httpx.Response(500, json={"status": 500})])])
+
+
+def test_europepmc_fulltext_500_is_actionable_and_negatively_cached():
+    http, h = _epmc500()
+    L = EvidenceLedger()
+    europepmc._FULLTEXT_UPSTREAM_FAIL.clear()
+    try:
+        out1 = europepmc.europepmc_fulltext_excerpts(http, L, "PMC1234567", ["dose"])
+        assert isinstance(out1, dict) and "upstream" in out1["error"] and "PMC1234567" in out1["error"]
+        assert "retrieval failure" in out1["error"]  # never phrased as absence of content
+        assert L.retrieval_status()["europepmc_fulltext_excerpts"]["failed"] == 1
+        n = len(h.calls)
+        out2 = europepmc.europepmc_fulltext_excerpts(http, L, "PMC1234567", ["dose"])
+        assert "upstream" in out2["error"]
+        assert len(h.calls) == n  # negative cache: no further HTTP attempt
+        assert L.retrieval_status()["europepmc_fulltext_excerpts"]["failed"] == 2
+    finally:
+        europepmc._FULLTEXT_UPSTREAM_FAIL.clear()
+
+
+def test_load_fulltext_500_marks_failed_and_uses_the_same_cache():
+    http, h = _epmc500()
+    L = EvidenceLedger()
+    rec = EvidenceRecord("PMCID:PMC1234567", "europepmc", "title", "https://example.org/x", content="abstract")
+    L.add(rec)
+    europepmc._FULLTEXT_UPSTREAM_FAIL.clear()
+    try:
+        assert europepmc.load_fulltext(http, L, "PMCID:PMC1234567", "1234567") == "failed"
+        assert rec.metadata["fulltext_status"] == "failed"
+        n = len(h.calls)
+        assert europepmc.load_fulltext(http, L, "PMCID:PMC1234567", "1234567") == "failed"
+        assert len(h.calls) == n  # negative cache
+    finally:
+        europepmc._FULLTEXT_UPSTREAM_FAIL.clear()

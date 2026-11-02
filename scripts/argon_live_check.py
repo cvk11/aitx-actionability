@@ -40,33 +40,37 @@ class Step:
     name: str
     billed: bool
     description: str
-    token_bound_input: int = 0  # conservative serialized-input bound for the reservation
-    token_bound_output: int = 0
+    sends: int = 0  # number of billed generate_content requests this step makes through GeminiLLM
 
 
 STEPS: list[Step] = [
     Step("auth_and_availability", False, "models.get('gemini-4-argon') metadata; proves key validity and model existence (no billing)"),
-    Step("basic_text", True, "one short text generation", 2000, 64),
-    Step("structured_json", True, "one structured JSON answer validated by Pydantic", 2500, 512),
-    Step("function_calling", True, "one declared tool invoked once, then final JSON", 3000, 512),
-    Step("multi_turn_tools", True, "two sequential tool rounds with function-response IDs, then final JSON", 4500, 768),
+    Step("basic_text", True, "one short text generation", 1),
+    Step("structured_json", True, "one structured JSON answer validated by Pydantic", 1),
+    Step("function_calling", True, "one declared tool invoked once, then final JSON", 2),
+    Step("multi_turn_tools", True, "two sequential tool rounds with function-response IDs, then final JSON", 3),
     Step("usage_metadata", False, "assert every settled call has input/output/cached/thought counts, served model and cost"),
 ]
 
+# The validation runs with a small output budget so a thinking model cannot be truncated by its own
+# reasoning (256 tokens + high thinking truncates step 2 in practice). The request reservation in
+# GeminiLLM._send is (serialized input bytes + 4096 overhead) * input price + max_tokens * output price;
+# the bound below mirrors that reservation for the billed sends.
+VALIDATE_MAX_TOKENS = 4096
+INPUT_EST_BYTES = 14_096  # conservative payload estimate including the +4096 byte overhead
+TOTAL_SENDS = sum(s.sends for s in STEPS)
 
-def cost_bound(steps: list[Step] | None = None) -> float:
-    """Conservative application-level bound for the billed steps (current price schedule)."""
+
+def cost_bound() -> float:
+    """Conservative application-level bound for the billed steps (current price schedule, reservation math)."""
     pin, pout, _ = argon_prices()
-    total = 0.0
-    for s in steps or STEPS:
-        if s.billed:
-            total += (s.token_bound_input * pin + s.token_bound_output * pout) / 1e6
-    return total
+    return TOTAL_SENDS * (INPUT_EST_BYTES * pin + VALIDATE_MAX_TOKENS * pout) / 1e6
 
 
 def print_plan() -> None:
     pin, pout, cache = argon_prices()
     print(f"model: {MODEL}  (prices today: input ${pin:.2f}/M, output+thinking ${pout:.2f}/M, implicit cache ${cache:.2f}/M)")
+    print(f"validation settings: max_output_tokens={VALIDATE_MAX_TOKENS}, thinking=low, {TOTAL_SENDS} billed requests")
     for i, s in enumerate(STEPS, 1):
         tag = "billed" if s.billed else "free"
         print(f"  {i}. {s.name:24s} [{tag:6s}] {s.description}")
@@ -121,7 +125,7 @@ def run_checks(settings: Settings, budget_usd: float) -> dict:
     try:
         from aitx.llm.gemini_client import GeminiLLM
 
-        small = get_settings(max_tokens=256, max_attempts=2)
+        small = get_settings(max_tokens=VALIDATE_MAX_TOKENS, max_attempts=2, effort="low")
         llm = GeminiLLM(small, cost, client=client)
 
         # 1 — auth + availability (no token billing)
@@ -189,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Pass --authorize-paid after reviewing the plan and Google billing controls. No request was sent.")
         return 3
 
-    settings = get_settings(max_tokens=256, max_attempts=2)
+    settings = get_settings(max_tokens=VALIDATE_MAX_TOKENS, max_attempts=2, effort="low")
     bound = cost_bound()
     if args.max_cost_usd < bound:
         print(f"--max-cost-usd {args.max_cost_usd:.2f} is below the conservative bound ${bound:.4f}; refusing.", file=sys.stderr)

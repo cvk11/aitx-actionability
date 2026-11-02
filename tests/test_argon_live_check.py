@@ -39,11 +39,13 @@ def test_cost_bound_matches_manual_sum():
     from aitx.llm.gemini_client import argon_prices
 
     pin, pout, _ = argon_prices()
-    expected = sum(((s.token_bound_input * pin + s.token_bound_output * pout) / 1e6) for s in argon_live_check.STEPS if s.billed)
+    expected = argon_live_check.TOTAL_SENDS * (argon_live_check.INPUT_EST_BYTES * pin + argon_live_check.VALIDATE_MAX_TOKENS * pout) / 1e6
     assert argon_live_check.cost_bound() == pytest.approx(expected)
-    # sanity: the billed steps exist and every step has a non-negative bound
+    # sanity: the billed steps exist, every step has a non-negative send count, and the bound stays
+    # far below the default --max-cost-usd so an authorized run cannot silently burn the whole budget
     assert sum(1 for s in argon_live_check.STEPS if s.billed) >= 4
-    assert all(s.token_bound_input >= 0 and s.token_bound_output >= 0 for s in argon_live_check.STEPS)
+    assert all(s.sends >= 0 for s in argon_live_check.STEPS)
+    assert argon_live_check.cost_bound() < 2.0
 
 
 def test_mini_toolbox_roundtrip_and_invalid_input():

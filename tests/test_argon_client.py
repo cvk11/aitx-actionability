@@ -106,6 +106,86 @@ def test_price_schedule_expiry():
     assert argon_prices(date(2026,12,1))==(4,20,0.2)
 
 
+class FillToolbox:
+    """ToolBox-compatible stub whose results grow the conversation history without any network use.
+    Each result carries its call number so tests can tell which rounds survived compaction."""
+
+    def __init__(self, size=20000):
+        self.size = size
+        self.calls = 0
+
+    def specs(self, names, strict=False):
+        return [{"name": "fill", "description": "Fills history", "input_schema": {"type": "object", "properties": {},
+                                                                                  "required": [], "additionalProperties": False}}]
+
+    def execute(self, name, args):
+        self.calls += 1
+        return f"R{self.calls} " + "x" * self.size, False
+
+
+def _tool_results(contents) -> list[str]:
+    out = []
+    for c in contents:
+        for p in c.parts or []:
+            fr = p.function_response
+            if fr is not None and isinstance(fr.response, dict):
+                out.append(fr.response.get("result", ""))
+    return out
+
+
+def _request_bound(kw) -> int:
+    payload = json.dumps({"contents": [c.model_dump(mode="json", exclude_none=True) for c in kw["contents"]],
+                          "config": kw["config"].model_dump(mode="json", exclude_none=True)}, ensure_ascii=False)
+    return len(payload.encode("utf-8")) + 4096
+
+
+def test_agent_compacts_growing_history_instead_of_aborting(settings):
+    # A real B_full run aborted at round 17 with "conservative context limit exceeded": the tool loop
+    # appends every round forever. The client must trim the oldest rounds (keeping the original user
+    # message and the latest rounds) so a long research session can still finalize.
+    class RecordingClient(Client):
+        def generate_content(self, **kw):
+            kw = dict(kw)
+            kw["contents"] = list(kw["contents"])  # snapshot: the caller mutates the list between calls
+            self.calls.append(kw)
+            return self.script.pop(0)
+
+    n_tool_rounds = 58
+    script = [response(parts=[types.Part(function_call=types.FunctionCall(id=str(i), name="fill", args={}))])
+              for i in range(n_tool_rounds)]
+    script.append(response(text='{"result":"ok"}'))  # ends the tool loop
+    script.append(response(text='{"result":"ok"}'))  # answers the schema-only finalization
+    llm = GeminiLLM(settings, CostTracker(12), client=RecordingClient(script))
+    tb = FillToolbox()
+    out = llm.agent(stage="x", system="s", user="u", output_model=Answer, toolbox=tb, tool_names=None, max_rounds=60)
+    assert out.result == "ok" and tb.calls == n_tool_rounds
+    assert llm.compacted_rounds > 0  # the overflow scenario actually exercised the new path
+    for kw in llm.client.calls:
+        assert _request_bound(kw) + settings.max_tokens <= 1048576 + 8  # no request ever exceeded the bound
+    last = llm.client.calls[-1]["contents"]
+    assert last[0].parts[0].text == "u"  # original user message preserved
+    assert last[-1].parts[0].text.startswith("Return the final JSON")  # finalization prompt preserved
+    kept = " ".join(_tool_results(last))
+    assert "R1 " not in kept  # the oldest rounds were compacted away
+    assert f"R{n_tool_rounds} " in kept  # the latest tool results are intact
+    assert 0 < kept.count("R") < n_tool_rounds  # most of the middle history was dropped
+    assert len(last) < 1 + 2 * n_tool_rounds + 1  # history is strictly smaller than an uncompacted run
+
+
+def test_agent_fails_closed_when_history_cannot_fit(settings):
+    # If even the last conversation pair exceeds the conservative bound (pathological single tool result),
+    # the client must still refuse to send rather than submit an over-limit request.
+    script = [response(parts=[types.Part(function_call=types.FunctionCall(id="1", name="fill", args={}))]),
+              response(text='{"result":"ok"}')]
+    llm, client, cost = invoke(settings, script)
+    tb = FillToolbox(size=1_100_000)
+    with pytest.raises(StructuredOutputError) as e:
+        llm.agent(stage="x", system="s", user="u", output_model=Answer, toolbox=tb, tool_names=None, max_rounds=2)
+    assert "context limit" in str(e.value)
+    assert llm.compacted_rounds == 0  # nothing could be trimmed
+    assert cost.reserved_usd == 0  # the over-limit request was never reserved/sent
+
+
 def test_real_sdk_request_serialization_without_network(settings):
     import httpx
     from google import genai
