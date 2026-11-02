@@ -63,21 +63,16 @@ def test_retrieval_status_categories():
     assert L.retrieval_status()["clinvar_lookup"] == {"with_results": 1, "empty": 1, "failed": 1, "truncated": 0, "partial": 0}
 
 
-def test_claude_opus_is_the_only_model(monkeypatch):
-    """Project decision 2026-11-02: no configuration builds a Gemini (or other non-Claude) client."""
-    import sys
-
+def test_argon_is_the_only_active_model(monkeypatch):
     from aitx import factory
-
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-placeholder")  # client construction only; no request is sent
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    assert all(o["reviewer"] in (None, "openai") for o in factory.CONFIGS.values())
-    for name, o in factory.CONFIGS.items():
-        if o["reviewer"] == "openai":
-            continue  # arm C placeholder raises NotImplementedError
+    from aitx.llm.gemini_client import GeminiLLM
+    monkeypatch.setenv("GEMINI_API_KEY", "offline-placeholder")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for name, opts in factory.CONFIGS.items():
+        if opts["reviewer"] == "openai":
+            continue
         p = factory.build_pipeline(name)
-        assert p.reviewer_llm is None and p.llm.model.startswith("claude-opus") and p.verifier_llm.model.startswith("claude-opus")
-    p = factory.build_pipeline("default")
-    assert p.reviewer_llm is None
-    assert "aitx.llm.gemini_client" not in sys.modules
-    assert "gemini" not in factory.__loader__.get_source("aitx.factory").split("# Project decision")[0].lower()
+        assert isinstance(p.llm, GeminiLLM) and isinstance(p.verifier_llm, GeminiLLM)
+        assert p.llm.model == p.verifier_llm.model == "gemini-4-argon"
+        assert p.reviewer_llm is None
+        p.llm.client.close()
