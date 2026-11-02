@@ -74,6 +74,7 @@ class Settings:
     gemini_price_in: float = field(default_factory=lambda: _float("AITX_GEMINI_PRICE_IN_PER_MTOK", -1.0))
     gemini_price_out: float = field(default_factory=lambda: _float("AITX_GEMINI_PRICE_OUT_PER_MTOK", -1.0))
     max_cost_usd_total: float = field(default_factory=lambda: _float("AITX_MAX_COST_USD_TOTAL", 30.0))
+    max_fix_cost_usd: float = field(default_factory=lambda: _float("AITX_MAX_FIX_COST_USD", 1.0))  # supervised self-repair fixer cap per cycle
     max_tokens: int = field(default_factory=lambda: _int("AITX_MAX_TOKENS", 32768))
     tool_result_char_limit: int = field(default_factory=lambda: _int("AITX_TOOL_RESULT_CHARS", 14000))
     deployment_mode: bool = field(default_factory=lambda: _bool("AITX_DEPLOYMENT_MODE", False))

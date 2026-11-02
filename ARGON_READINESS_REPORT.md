@@ -116,7 +116,18 @@ Düzeltilmiş dal ile yapılan ikinci ücretli denemede bağlam tükenmesi **bir
 
 Regresyon testleri: anormal şekil kabulü + tutarlı faturalama; kullanılamaz şekilde sayaçlı hata (2 yeni test).
 
-## 9. Nihai karar
+## 9. Denetimli kendini onarma (supervised self-repair)
+
+`scripts/run_supervised.py`: koşu, kod düzeyinde bir hatayla (`stage_incomplete` + istisna imzası) düşerse, Argon'dan (API, döngü başına `AITX_MAX_FIX_COST_USD=1.00` üst sınır) teşhis + en küçük düzeltme ister; öneri şu raylara tabidir:
+
+- yalnızca mevcut `src/aitx/**` dosyaları (testler/resmî veri/promptlar/deployment dokunulmaz, yeni dosya açılamaz, yol hilesi engelli);
+- uygulanan öneri tam çevrimdışı paketten geçmek zorunda — geçemezse `git checkout` ile otomatik geri alınır;
+- kabul edilen düzeltme `supervised fix: ...` commit'i olur; reddedilen öneriler `outputs/internal/<id>.supervised.json`'da kayıtlıdır;
+- bütçe/ret (BudgetExceeded/ModelRefusal) ve gönderilebilir sonuçlar asla düzelticiyi tetiklemez; en fazla 2 düzeltme döngüsü.
+
+Her döngü konsola ve `supervised.json`'a sonuç yazar (`submittable` / `reverted_after_test_failure` / `proposal_rejected` / `not_fixable` / `fixer_error` / `max_fix_cycles_exhausted`) — takılmaz, her zaman bir sonuçla biter. 8 çevrimdışı ray testi eklendi.
+
+## 10. Nihai karar
 
 **READY FOR ONE CONTROLLED ARGON RETRY**
 
