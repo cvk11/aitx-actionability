@@ -14,6 +14,6 @@ pinned: false
 * gradio_client: `Client("<owner>/<space>").predict(payload, api_name="/actionability_report")`
 * HTTP: `POST /actionability_report` with the JSON input object
 
-Models (pinned): `claude-opus-5-5` (primary + verifier); optional reviewer `gemini-4-argon`.
+Model (pinned): `claude-opus-5-5` (research, verification and report generation). No other model provider is used.
 No-logging policy: inputs/outputs are never logged, stored, cached to disk, redistributed, or used for training.
-Secrets required: `ANTHROPIC_API_KEY` (optional `GEMINI_API_KEY`, `NCBI_API_KEY`, `NCBI_EMAIL`).
+Secrets required: `ANTHROPIC_API_KEY` (optional free `NCBI_API_KEY`, `NCBI_EMAIL`).

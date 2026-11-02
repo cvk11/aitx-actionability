@@ -51,7 +51,7 @@ def main() -> int:
           f"cap/case={s.max_cost_usd_per_case} reserve={s.call_reserve_usd}")
     for k, v in rows.items():
         print(f"{k}: total ~${sum(v.values()):.2f}  " + ", ".join(f"{a}=${b:.2f}" for a, b in v.items()))
-    print("Optional: development judge ~$0.35; Gemini reviewer + adjudication + follow-up research ~$1.5-3 (Claude part) + Gemini cost.")
+    print("Optional: development judge ~$0.35. Claude Opus is the only model; no other provider is billed.")
     return 0
 
 

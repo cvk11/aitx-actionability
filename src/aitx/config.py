@@ -63,7 +63,7 @@ class Settings:
     gemini_model: str = field(default_factory=lambda: _str("AITX_GEMINI_MODEL", "gemini-4-argon"))
     effort: str = field(default_factory=lambda: _str("AITX_EFFORT", "high"))
     verifier_effort: str = field(default_factory=lambda: _str("AITX_VERIFIER_EFFORT", "medium"))
-    enable_gemini: bool = field(default_factory=lambda: _bool("AITX_ENABLE_GEMINI", False))
+    enable_gemini: bool = False  # archived: Gemini is not used by any pipeline configuration (project decision 2026-11-02)
     refusal_fallback: bool = field(default_factory=lambda: _bool("AITX_REFUSAL_FALLBACK", True))
     max_tool_rounds: int = field(default_factory=lambda: _int("AITX_MAX_TOOL_ROUNDS", 24))
     max_revisions: int = field(default_factory=lambda: _int("AITX_MAX_REVISIONS", 2))
@@ -110,7 +110,6 @@ class Settings:
             str(self.genereviews_dir.relative_to(PROJECT_ROOT)) if self.genereviews_dir.is_relative_to(PROJECT_ROOT) else "<external>"
         )
         d["anthropic_api_key_present"] = bool(os.environ.get("ANTHROPIC_API_KEY"))
-        d["gemini_api_key_present"] = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
         return d
 
 

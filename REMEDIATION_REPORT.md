@@ -21,7 +21,10 @@ Scope: findings B1–B9 and the medium-severity items of the independent Codex/A
 | M: pytest warning | `asyncio_default_fixture_loop_scope` unknown without pytest-asyncio | `pyproject.toml` | Option removed | full suite | 2 remaining warnings come from Gradio/Pandas | – |
 
 ## Test status after remediation
-`pytest`: **77 passed** (offline; 24 in `tests/test_audit_regressions.py`), 2 third-party warnings (Gradio/Pandas). `pytest -m live`: **4 passed** (free public APIs, CFTR control). No paid model call.
+`pytest`: **78 passed** (offline; 24 in `tests/test_audit_regressions.py`, 1 Claude-only policy test), 2 third-party warnings (Gradio/Pandas). `pytest -m live`: **4 passed** (free public APIs, CFTR control). No paid model call.
+
+## Model policy update (2026-11-02, after remediation)
+Gemini is not used. No pipeline configuration constructs a Gemini client (`factory.CONFIGS` has no Gemini arm; the default path has no reviewer); `src/aitx/llm/gemini_client.py` is archived and never imported; `google-genai` removed from runtime/deployment requirements; no Gemini key is read. Enforced by `tests/test_milestone_checks.py::test_claude_opus_is_the_only_model`. The B7 Gemini fail-closed pricing guard remains in the archived module only.
 
 ## Not addressed / out of scope for this remediation
 - Scientific validity of real LLM reports (no paid inference run) — requires the controlled ITPR1 run and expert review.

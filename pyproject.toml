@@ -16,7 +16,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gemini = ["google-genai==2.34.0"]
 deploy = ["gradio==6.31.0", "fastapi==0.162.0", "uvicorn==0.54.0"]
 dev = ["pytest==9.2.0", "respx==0.23.1", "gradio_client==2.7.2"]
 

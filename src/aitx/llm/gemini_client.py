@@ -1,4 +1,7 @@
-"""Optional independent reviewer on Google Gemini (google-genai SDK).
+"""ARCHIVED — not used. Project decision (2026-11-02): Claude Opus is the only active model; no pipeline
+configuration constructs this client and google-genai is not a runtime dependency.
+
+Former optional independent reviewer on Google Gemini (google-genai SDK).
 
 Only `structured()` is implemented: the reviewer receives the draft and the
 evidence digest and returns structured issues. It has no tools; any external

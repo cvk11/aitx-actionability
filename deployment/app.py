@@ -11,7 +11,7 @@ Output: {"id": <same id>, "report_markdown": <markdown>}
 No-logging policy (required by the organizers): evaluation inputs and outputs
 are never logged, written to disk, cached on disk, or reused. Deployment mode
 is forced when running on a Space (SPACE_ID set) or AITX_DEPLOYMENT_MODE=true.
-Secrets (ANTHROPIC_API_KEY, optional GEMINI_API_KEY, NCBI_API_KEY) are read
+Secrets (ANTHROPIC_API_KEY; optional free NCBI_API_KEY/NCBI_EMAIL) are read
 from Space secrets only.
 """
 

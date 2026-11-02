@@ -8,7 +8,7 @@ Evidence-grounded agentic system that turns a confirmed rare-disease genotype + 
 
 | Category | Meaning | Result |
 |---|---|---|
-| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, 24 audit-regression tests | 77 passed |
+| Offline tests (`pytest`) | Mock LLM + fake HTTP on a fictional gene; rules, rendering, QC, endpoint contract, 24 audit-regression tests, Claude-only model policy | 78 passed |
 | Live retrieval tests (`pytest -m live`) | Free public APIs (PubMed, CT.gov, ClinVar, FDA labels, Europe PMC, VV/VEP) on the public CFTR example | 4 passed |
 | Deterministic scientific checks (`scripts/scientific_checks.py`) | HGVS/transcript/exon/NMD/ClinVar/ClinGen/GeneReviews/trials on the 4 official cases + CFTR control | see `docs/SCIENTIFIC_CHECKS.md` |
 | Genuine LLM clinical inference | Claude research, interpretation, verification | **not run** (requires authorization + `ANTHROPIC_API_KEY`) |
@@ -43,7 +43,7 @@ Build the GeneReviews snapshot (official NCBI archive, ~640 MB streamed, ~1 min;
 ```bash
 python scripts/build_genereviews_index.py
 ```
-Configuration: copy `.env.example` to `.env` and fill keys locally (never commit `.env`). Optional free `NCBI_API_KEY`/`NCBI_EMAIL` raise NCBI rate limits.
+Configuration: copy `.env.example` to `.env` and fill `ANTHROPIC_API_KEY` locally (never commit `.env`; never paste keys into chats or issues). Optional free `NCBI_API_KEY`/`NCBI_EMAIL` raise NCBI rate limits. No other model-provider key is used.
 
 ## Usage
 Offline tests (no network, no cost):
@@ -88,7 +88,7 @@ Key properties: models cite only evidence-ledger keys retrieved in the same run;
 ```
 src/aitx/            config, schemas, template, http, ledger, variant_model, clinical, rules, render, qc, pipeline, factory, robustness
 src/aitx/retrieval/  ncbi, clinicaltrials, variant, drugs, europepmc, genereviews, web, registry (tool specs)
-src/aitx/llm/        anthropic_client (Claude), gemini_client (optional), mock, base (cost/budget)
+src/aitx/llm/        anthropic_client (Claude), mock, base (cost/budget); gemini_client is archived and unused
 src/aitx/agents/     interpreter (A), researcher (B/C), verifier (D), reviewer (E), synthesizer (F), context
 prompts/             version-controlled templates (SHA-256 recorded per run)
 data/official*/      verbatim official template and cases + SHA-256 provenance
@@ -99,10 +99,13 @@ tests/               offline unit/integration/endpoint tests + live smoke tests
 ```
 
 ## Models
-Primary and verifier: `claude-opus-5-5` (exact identifier; aliases such as "latest" are rejected by config). Optional reviewer: `gemini-4-argon` (stable code per Google's model page, 2026-11-01). Arm C (independent OpenAI research) is a placeholder only.
+Claude Opus only: `claude-opus-5-5` for research, interpretation, verification and synthesis (exact identifier; aliases such as "latest" are rejected by config). Gemini is not used (project decision 2026-11-02; no Gemini key is read). Arm C (independent OpenAI research) is a placeholder only.
+
+## Cost (estimate, not a measurement)
+`python scripts/estimate_cost.py` — with `AITX_MAX_TOOL_ROUNDS=16`: expected ≈ $5.5, worst case under the model's assumptions ≈ $7.5 per patient (Claude Opus 5.5 at $4/$20 per MTok; includes fail-closed re-verification and synthesis verification). Application-level guard `AITX_MAX_COST_USD_PER_CASE=12` (atomic per-request reservations, see `COST_AND_LIMITATIONS.md`); it is **not** a provider-enforced cap — also set a spend limit in the Anthropic Console.
 
 ## Privacy and security
-No API keys in code or history (see `CODEX_REVIEW_GUIDE.md` for the scan procedure). In deployment mode (forced on a Space), no disk cache, no artifacts, no input/output logging; Gradio analytics, run history, monitoring and flagging are disabled.
+Secret scan (2026-11-02, all tracked files and every commit in history): no Anthropic/OpenAI/Google/GitHub/Hugging Face/AWS/Slack token patterns, no private keys, no hardcoded credential assignments; `.env` absent and git-ignored; caches, GeneReviews archive and internal outputs not tracked. Procedure in `CODEX_REVIEW_GUIDE.md` §9. In deployment mode (forced on a Space), no disk cache, no artifacts, no input/output logging; Gradio analytics, run history, monitoring and flagging are disabled.
 
 ## License / data
 Code: to be decided by the owner (no license file yet). GeneReviews content © University of Washington — not redistributed; rebuilt from NCBI's official archive. Official challenge files © the organizers, included verbatim for reproducibility.

@@ -1,4 +1,4 @@
-"""Agent E — optional independent review (Gemini, or a second Claude call) and
+"""Agent E — optional independent review (off by default; no reviewer is configured — Gemini is not used) and
 evidence-grounded adjudication by Claude. The reviewer never edits the report:
 accepted issues become revision problems; `needs_research` issues trigger one
 bounded follow-up research loop whose output is verified like everything else."""

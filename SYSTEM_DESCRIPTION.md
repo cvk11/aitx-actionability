@@ -4,7 +4,7 @@
 
 **Name:** aitx-actionability — evidence-ledger agentic pipeline for therapeutic actionability reports.
 
-**Tier:** 3 (Unrestricted). **Base model:** Anthropic Claude Opus 5.5, exact model identifier `claude-opus-5-5` (adaptive thinking, effort `high`; verifier effort `medium`). Server-side refusal fallback (`fallbacks: "default"`) is enabled; the model that actually served every call is recorded, and any fallback is disclosed in the run manifest. Optional independent reviewer: Google Gemini `gemini-4-argon` (off by default; not used unless stated).
+**Tier:** 3 (Unrestricted). **Base model:** Anthropic Claude Opus 5.5, exact model identifier `claude-opus-5-5` (adaptive thinking, effort `high`; verifier effort `medium`). Server-side refusal fallback (`fallbacks: "default"`) is enabled; the model that actually served every call is recorded, and any fallback is disclosed in the run manifest. Claude Opus is the only model used for research, interpretation, verification and report generation; no other model provider is called.
 
 **Architecture.** One generalizable pipeline for every patient; no case-specific code, prompts or answers (enforced by an automated test).
 1. *Deterministic molecular bootstrap (no LLM):* RefSeq transcript model from the NCBI feature table (exon/intron position, exon coding length and reading frame, PTC position, rule-based NMD prediction), VariantValidator nomenclature check, Ensembl VEP cross-check, ClinVar exact-HGVS match, ClinGen validity/dosage, gnomAD constraint, UniProt features at the residue, GeneReviews chapters, open trials.
