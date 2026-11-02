@@ -49,12 +49,12 @@ Temiz ortam: Python 3.12.10, `.venv`, `pip install -r requirements.txt && pip in
 
 ```bash
 .venv/Scripts/python.exe -m pytest -q --tb=short          # çevrimdışı
-# → 268 passed, 7 deselected (live), 2 warnings (gradio/pandas, kodumuzdan değil)
+# → 294 passed, 7 deselected (live), 2 warnings (gradio/pandas, kodumuzdan değil)
 .venv/Scripts/python.exe -m pytest -m live -q --tb=short  # ücretsiz kamu API'leri
-# → 7 passed, 268 deselected
+# → 7 passed, 294 deselected
 ```
 
-- Çevrimdışı 268: birim + audit regresyonları (B1–B9, S1–S10, R1–R9), ITPR1 regresyonları, beş bilimsel bloker adversarial paketi, retrieval-failure (Europe PMC 500 negatif belleği dahil), scientific-readiness, deployment endpoint (3), milestone, tam sentetik pipeline (Argon yanıt nesneleriyle), 4 `test_argon_live_check` guard'ı ve 4 yeni düzeltme regresyonu (geçmiş sıkıştırma ×2, Europe PMC ×2).
+- Çevrimdışı 294: birim + audit regresyonları (B1–B9, S1–S10, R1–R9), ITPR1 regresyonları, beş bilimsel bloker adversarial paketi, retrieval-failure (Europe PMC 500 negatif belleği dahil), scientific-readiness, deployment endpoint (3), milestone, tam sentetik pipeline (Argon yanıt nesneleriyle), guard'lar ve düzeltme regresyonları (geçmiş sıkıştırma, sıkıştırılamaz-fail-closed, rol dizilimi, Europe PMC ×2, billing şekilleri, transport yeniden denemeleri).
 - Canlı 7: PubMed/E-utilities, ClinVar, ClinicalTrials.gov, FDA etiketi, Europe PMC, VV/VEP, ITPR1 kanıt + zorunlu terapötik kapsam tamlığı (hepsi ücretsiz, kimlik bilgisi yok).
 - Astra'nın iddialarına karşı: 257 çevrimdışı iddiası → 260 doğrulandı; 18 hedefli Argon testi → `test_argon_client.py` (12 test + parametrizasyonlar) ve diğer Argon testleri paketin içinde geçti; 3 deployment endpoint testi → geçti; 7 canlı → geçti.
 
@@ -125,9 +125,17 @@ Regresyon testleri: anormal şekil kabulü + tutarlı faturalama; kullanılamaz 
 - kabul edilen düzeltme `supervised fix: ...` commit'i olur; reddedilen öneriler `outputs/internal/<id>.supervised.json`'da kayıtlıdır;
 - bütçe/ret (BudgetExceeded/ModelRefusal) ve gönderilebilir sonuçlar asla düzelticiyi tetiklemez; en fazla 2 düzeltme döngüsü.
 
-Her döngü konsola ve `supervised.json`'a sonuç yazar (`submittable` / `reverted_after_test_failure` / `proposal_rejected` / `not_fixable` / `fixer_error` / `max_fix_cycles_exhausted`) — takılmaz, her zaman bir sonuçla biter. **Oturum tavanı:** `--max-total-cost-usd N` ile koşular + düzeltici çağrıları birlikte sert biçimde sınırlanır; her döngüye yalnızca kalan bütçe kadar vaka payı verilir, aşım öncesi `total_budget_reached` ile durur ve harcanan toplam `spent_usd` olarak rapora yazılır. 10 çevrimdışı ray testi eklendi.
+Her döngü konsola ve `supervised.json`'a sonuç yazar (`submittable` / `reverted_after_test_failure` / `proposal_rejected` / `not_fixable` / `fixer_error` / `max_fix_cycles_exhausted`) — takılmaz, her zaman bir sonuçla biter. **Oturum tavanı:** `--max-total-cost-usd N` ile koşular + düzeltici çağrıları birlikte sert biçimde sınırlanır (varsayılan 12.00); her döngüye yalnızca kalan bütçe kadar vaka payı verilir, aşım öncesi `total_budget_reached` ile durur ve harcanan toplam `spent_usd` olarak rapora yazılır. Bağımsız düşmanca denetimde bulunan ek raylar da eklendi: çöken koşu tam döngü bütçesiyle muhafazakâr sayılır; kirli ağaçta düzeltme uygulanmaz; yalnızca git-takip edilen, çözümü `src/aitx` içinde kalan dosyalar yazılabilir (junction kaçışı kapalı); geri alma/commit hataları kayda geçip eski haline döner; düzelticinin faturası yanıt ayrıştırılamasa bile sayılır; her döngünün audit'i ayrı klasörde saklanır. 15 çevrimdışı ray testi eklendi.
 
-## 10. Nihai karar
+**Billing kapısı değişikliği (bilinçli):** `bill > reserved estimate` durumu artık fail-closed abort yerine **işaretli-muhafazakâr** davranır — düşünce token'ları output olarak faturalanır ama `max_output_tokens` ile sınırlı DEĞİLDİR, bu yüzden geçerli bir STOP turu rezervasyon tahminini aşabilir; böyle bir tur öldürülmez, gerçek faturası kaydedilir ve `uncertain_billing` bayrağıyla denetime düşer. Eksik faturalama yok (settle `max(gerçek, rezerve)` uygular) ve bütçe hâlâ rezervasyon anında uygulanır. Transport düzeyi ayrımı da eklendi: sağlayıcıya hiç ulaşmamış bağlantı hataları faturalanmaz; 408/409/413/422/429/5xx sınırlı denemeyle yeniden denenir.
+
+## 10. Üçüncü gerçek koşu: eksik/kesik yanıt (E_followup:r9) ve denetimli onarımın ilk sahada çalışması
+
+Üçüncü ücretli denemede bağlam ve billing hataları bir daha görülmedi; koşu araştırmayı ve doğrulamayı geçti, el-aktarım takip araştırmasının 9. turunda Gemini eksik/kesik bir yanıt (`finish_reason ≠ STOP`) döndürdü ve istemci fail-closed durdu. **Süpervizörün ilk saha testi başarılıydı:** Argon doğru teşhisi koydu ("geçici eksik yanıtları sınırlı deneme bütçesi içinde yeniden dene"), önerisi çevrimdışı paketi kırdığı için raylar onu **otomatik geri aldı** (`reverted_after_test_failure`) ve ek harcama olmadan bitti.
+
+**Düzeltme (61f42ae):** eksik/kesik/engellenmiş aday turları artık sağlayıcı hataları gibi sınırlı denemeyle yeniden deneniyor (her deneme kendi muhasebesini kapatır; sohbet değişmediği için kanıt kaybı yok); bütçe bitince `candidates`/`finish_reason` içeren mesajla fail-closed. Sağlayıcı/model uyuşmazlığı, ayrıştırma hatası ve beklenmeyen araç çağrısı yine anında durur. Süpervizör artık her denemenin tam audit/ledger/raporunu diske kaydediyor ve reddedilen döngülerde test paketinin çıktı kuyruğunu rapora ekliyor.
+
+## 11. Nihai karar
 
 **READY FOR ONE CONTROLLED ARGON RETRY**
 

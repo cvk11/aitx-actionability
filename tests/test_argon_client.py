@@ -5,6 +5,7 @@ from types import SimpleNamespace as NS
 from dataclasses import replace
 
 import pytest
+import httpx
 from google.genai import types
 from pydantic import BaseModel
 
@@ -117,15 +118,49 @@ class ProviderError(Exception):
     def __init__(self,code): self.code=code;super().__init__('SECRET provider response')
 
 
-@pytest.mark.parametrize('code,n_calls',[(429,3),(503,3),(401,1),(403,1)])
-def test_bounded_retries_and_sanitized_errors(settings,monkeypatch,code,n_calls):
+@pytest.mark.parametrize('code,n_calls,charged',[(429,3,False),(503,3,True),(408,3,True),(422,3,True),(401,1,False),(403,1,False)])
+def test_bounded_retries_and_sanitized_errors(settings,monkeypatch,code,n_calls,charged):
     monkeypatch.setattr('aitx.llm.gemini_client.time.sleep',lambda _:None)
     llm,client,cost=invoke(settings,[ProviderError(code)]*3)
     with pytest.raises(StructuredOutputError) as e:
         llm.structured(stage='x',system='s',user='u',output_model=Answer)
     assert len(client.calls)==n_calls and 'SECRET' not in str(e.value)
     assert cost.reserved_usd==0
-    assert bool(cost.calls)==(code==503)
+    assert bool(cost.calls)==charged
+
+
+@pytest.mark.parametrize('exc,charged', [
+    (httpx.ConnectError('no route'), False),
+    (httpx.ConnectTimeout('t'), False),
+    (httpx.ReadTimeout('t'), True),
+])
+def test_transport_failures_retry_and_bill_by_reachability(settings, monkeypatch, exc, charged):
+    # A transient network failure must not kill the stage, and a connection that never reached the
+    # provider must not be billed at the reserved bound (only uncertain mid-flight failures are).
+    monkeypatch.setattr('aitx.llm.gemini_client.time.sleep', lambda _: None)
+    llm, client, cost = invoke(settings, [exc, exc, exc])
+    with pytest.raises(StructuredOutputError) as e:
+        llm.structured(stage='x', system='s', user='u', output_model=Answer)
+    assert len(client.calls) == 3
+    assert bool(cost.calls) == charged
+    assert 'code=None' in str(e.value)
+    assert cost.reserved_usd == 0
+
+
+def test_valid_turn_with_huge_thinking_is_accepted_and_flagged(settings):
+    # Thinking tokens are billed as output but are NOT capped by max_output_tokens; a valid STOP turn
+    # whose bill overshoots the reserved estimate must be accepted, recorded at its true cost and
+    # flagged uncertain — never kill a healthy stage over a reservation mismatch.
+    um = types.GenerateContentResponseUsageMetadata(prompt_token_count=1000, candidates_token_count=100,
+                                                    thoughts_token_count=40000, cached_content_token_count=0)
+    llm, client, cost = invoke(settings, [response(usage=um)])
+    assert llm.structured(stage='x', system='s', user='u', output_model=Answer).result == 'ok'
+    rec = cost.calls[0]
+    pin, pout, cache = argon_prices()
+    assert rec.uncertain_billing is True
+    assert rec.output_tokens == 40100
+    assert rec.cost_usd >= (1000 * pin + 40100 * pout) / 1e6  # true bill never understated
+    assert cost.reserved_usd == 0
 
 
 def test_parallel_tool_calls_keep_signatures_ids_and_results(settings):
@@ -139,7 +174,9 @@ def test_parallel_tool_calls_keep_signatures_ids_and_results(settings):
     assert out.result=='ok' and len(seen)==2
     history=client.calls[-1]['contents']
     assert history[1].parts[0].thought_signature==b'opaque'
-    assert [p.function_response.id for p in history[2].parts]==['a','b']
+    # the finalization prompt is merged into the trailing user turn, so filter the tool results
+    assert [p.function_response.id for p in history[2].parts if p.function_response]==['a','b']
+    assert any(p.text and 'Return the final JSON' in p.text for p in history[2].parts)
     assert client.calls[-1]['config'].tools is None
 
 
@@ -226,6 +263,39 @@ def test_agent_fails_closed_when_history_cannot_fit(settings):
     assert "context limit" in str(e.value)
     assert llm.compacted_rounds == 0  # nothing could be trimmed
     assert cost.reserved_usd == 0  # the over-limit request was never reserved/sent
+
+
+def test_compact_keeps_alternation_for_even_length_histories(settings):
+    # Direct unit pin for the parity hardening: an even-length history (e.g. [user, model, user, user]
+    # after a merged finalization) must still trim to [first user] + a model-starting tail so roles
+    # stay strictly alternating; the naive tail slice would start with a user content.
+    llm = GeminiLLM(settings, CostTracker(12), client=object())
+    mk = lambda role, text: types.Content(role=role, parts=[types.Part(text=text)])
+    contents = [mk("user", "u0"), mk("model", "m1"), mk("user", "u1"), mk("model", "m2"),
+                mk("user", "u2"), mk("user", "u3")]  # even length, ends user (trailing merged turn)
+    trimmed = llm._compact(contents, keep_pairs=2)
+    assert trimmed is not None
+    assert trimmed[0] is contents[0]  # original user message preserved
+    assert [c.role for c in trimmed] == ["user", "model", "user", "user"]
+    assert not any(trimmed[i].role == trimmed[i + 1].role for i in range(len(trimmed) - 2))  # no model/model
+
+
+def test_finalization_after_round_exhaustion_keeps_role_alternation(settings):
+    # When the tool loop exhausts max_rounds with a trailing tool call, the history ends with a USER
+    # tool response; the finalization prompt must be merged into that turn (consecutive same-role
+    # contents are invalid for the API) and the request must still carry it.
+    script = [response(parts=[types.Part(function_call=types.FunctionCall(id="1", name="fill", args={}))]),
+              response(text='{"result":"ok"}')]
+    llm, client, cost = invoke(settings, script)
+    tb = FillToolbox(size=10)
+    out = llm.agent(stage="x", system="s", user="u", output_model=Answer, toolbox=tb, tool_names=None, max_rounds=1)
+    assert out.result == "ok" and tb.calls == 1
+    last = client.calls[-1]["contents"]
+    roles = [c.role for c in last]
+    assert not any(roles[i] == roles[i + 1] for i in range(len(roles) - 1))  # strict alternation
+    final_text = " ".join(p.text or "" for c in last for p in c.parts if p.text)
+    assert "Return the final JSON" in final_text  # the finalization prompt survived the merge
+    assert any(p.function_response for c in last for p in c.parts)  # the tool result survived the merge
 
 
 def test_usage_with_cached_above_prompt_is_accepted_and_billed_consistently(settings):

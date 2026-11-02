@@ -125,15 +125,18 @@ def load_fulltext(http: HttpClient, ledger: EvidenceLedger, key: str, pmcid: str
         pmcid = "PMC" + pmcid
     if time.monotonic() - _FULLTEXT_UPSTREAM_FAIL.get(pmcid, -1e9) < _FULLTEXT_UPSTREAM_FAIL_TTL:
         rec.metadata["fulltext_status"] = "failed"
+        ledger.log_query("europepmc_fulltext", {"pmcid": pmcid}, [], error=f"recent upstream failure cached for {pmcid}")
         return "failed"
     try:
         r = http.request("GET", f"{BASE}/{pmcid}/fullTextXML")
     except RetryableHTTPError:
         _FULLTEXT_UPSTREAM_FAIL[pmcid] = time.monotonic()
         rec.metadata["fulltext_status"] = "failed"
+        ledger.log_query("europepmc_fulltext", {"pmcid": pmcid}, [], error=f"upstream HTTP 500/429 for {pmcid}")
         return "failed"
     except Exception:
         rec.metadata["fulltext_status"] = "failed"
+        ledger.log_query("europepmc_fulltext", {"pmcid": pmcid}, [], error="request failed")
         return "failed"
     if r.status != 200 or "<" not in r.text[:10]:
         rec.metadata["fulltext_status"] = "not_open_access" if r.status in (404, 400) else "failed"

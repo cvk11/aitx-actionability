@@ -2,29 +2,37 @@
 """Supervised B_full runner: Argon-driven, rail-guarded self-repair (PAID, gated).
 
 Runs one case through the B_full pipeline. If the run fails with a CODE error
-(stage_incomplete + an exception signature, e.g. the two defects found in the
-first real runs), it asks gemini-4-argon — through the API, with its own small
+(stage_incomplete + an exception signature, or an in-process exception whose
+text carries one), it asks gemini-4-argon — through the API, with its own small
 capped budget — to propose a minimal fix. The proposal is applied ONLY under
 hard rails, re-verified by the full offline suite, and committed; a proposal
 that breaks any offline test is reverted automatically. Budget/refusal aborts
 and submittable results never trigger the fixer.
 
 HARD RAILS (enforced in code, not just the prompt):
-  * only files under src/aitx/ may be modified (no tests/, data/, prompts/,
-    deployment/, no new directories, no path tricks);
+  * only EXISTING, GIT-TRACKED files under src/aitx/ may be modified, and the
+    resolved path must stay inside src/aitx (junctions/symlinks cannot escape);
+  * the git tree must be clean (no tracked modifications) before any edit, so a
+    revert can never destroy the operator's own work;
   * every applied proposal must pass the full offline suite, else git-reverted;
-  * the fixer may not touch evidence rules' fail-closed gates indirectly — it
-    cannot edit tests, so any weakening that the adversarial suite covers fails;
-  * per-cycle fixer budget is capped; at most --max-fix-cycles proposals.
+  * accepted fixes are committed with an explicit pathspec; a further paid run happens only while
+    a cycle remains within the budget — with a single cycle the fix is committed but not re-run,
+    and the outcome says so (fix_committed_but_not_rerun);
+  * a hard session cap (--max-total-cost-usd, DEFAULT 12.00) bounds pipeline
+    runs AND fixer calls together; a crashed run (no result object) is charged
+    conservatively at its full cycle budget so the cap can never under-count;
+  * at most --max-fix-cycles (clamped 1..2) fix proposals.
 
 No paid request is sent without --authorize-paid. Patient artifacts are written
-to outputs/internal/ (git-ignored). Checkpoint/resume is intentionally not part
-of this tool: an aborted case restarts from scratch (see ARGON_READINESS_REPORT).
+to outputs/internal/ (git-ignored); every cycle's audit is kept in a per-cycle
+directory so nothing is overwritten. Checkpoint/resume is intentionally not part
+of this tool: an aborted case restarts from scratch.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -45,6 +53,7 @@ STOP_ERRORS = ("BudgetExceeded", "ModelRefusal")
 FILE_PATH_IN_TRACEBACK = re.compile(r'(?:File\s+")([^"]+\.py)"', re.I)
 CONTEXT_FILE_LIMIT = 3
 CONTEXT_CHAR_LIMIT = 14000
+DEFAULT_SESSION_CAP_USD = 12.0
 
 
 class FixFile(BaseModel):
@@ -58,14 +67,14 @@ class FixProposal(BaseModel):
     summary: str = ""
 
 
-def should_fix(blockers: list[dict]) -> bool:
+def should_fix(blockers: list[dict] | None, err: str | None = None) -> bool:
     """Only code-level stage failures trigger the fixer; budget/refusal never does."""
     for b in blockers or []:
         if b.get("code") == "stage_incomplete":
             detail = b.get("detail", "")
             if CODE_ERROR.search(detail) and not any(s in detail for s in STOP_ERRORS):
                 return True
-    return False
+    return bool(err) and bool(CODE_ERROR.search(err or "")) and not any(s in (err or "") for s in STOP_ERRORS)
 
 
 def _safe_path(path: str) -> str | None:
@@ -80,6 +89,7 @@ def validate_proposal(prop: FixProposal, root: Path = ROOT) -> list[str]:
     problems: list[str] = []
     if not prop.files:
         problems.append("proposal contains no file edits")
+    src_root = (root / "src" / "aitx").resolve()
     for f in prop.files:
         p = _safe_path(f.path)
         if p is None or not p.startswith(ALLOWED_PREFIX):
@@ -91,6 +101,17 @@ def validate_proposal(prop: FixProposal, root: Path = ROOT) -> list[str]:
         target = root / p
         if not target.exists():
             problems.append(f"target does not exist (new files are not allowed): {f.path!r}")
+            continue
+        if not target.is_file():
+            problems.append(f"target is not a regular file: {f.path!r}")
+            continue
+        try:
+            resolved = target.resolve()
+        except OSError:
+            problems.append(f"target cannot be resolved: {f.path!r}")
+            continue
+        if not resolved.is_relative_to(src_root):
+            problems.append(f"target resolves outside src/aitx (junction/symlink): {f.path!r}")
     return problems
 
 
@@ -112,10 +133,10 @@ def traceback_files(tb_text: str) -> list[str]:
 DEFAULT_CONTEXT_FILES = ["src/aitx/llm/gemini_client.py", "src/aitx/llm/base.py", "src/aitx/pipeline.py"]
 
 
-def fixer_context(tb_text: str, failure: str) -> dict[str, Any]:
-    """Failure text plus the content of the source files named in the traceback (bounded)."""
+def fixer_context(failure: str) -> dict[str, Any]:
+    """Failure text (incl. any traceback) plus the content of the source files it names (bounded)."""
     files: dict[str, str] = {}
-    paths = traceback_files(tb_text) or DEFAULT_CONTEXT_FILES
+    paths = traceback_files(failure) or DEFAULT_CONTEXT_FILES
     total = 0
     for p in paths[:CONTEXT_FILE_LIMIT]:
         try:
@@ -126,7 +147,6 @@ def fixer_context(tb_text: str, failure: str) -> dict[str, Any]:
         files[p] = text[:budget]
         total += budget
         if total >= CONTEXT_CHAR_LIMIT:
-            files[p] += "\n...[file truncated by the supervisor; keep the fix minimal]"
             break
     if not files:
         files["(no source shown)"] = "The supervisor could not show source files; propose a fix only if the failure text identifies the defect."
@@ -169,7 +189,7 @@ class Supervisor:
         try:
             res = build_pipeline("B_full", self.current_settings).run(case)
             return res, None
-        except Exception as e:  # pipeline catches its own errors; this is a last resort
+        except Exception as e:  # e.g. a QC/link failure raised outside the pipeline's own handler
             return None, f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
 
     def run_suite(self) -> bool:
@@ -188,21 +208,31 @@ class Supervisor:
         from aitx.llm.gemini_client import GeminiLLM
 
         if self.total_budget is not None:
-            fixer_budget = max(0.0, min(self.settings.max_fix_cost_usd, self.total_budget - self.spent))
+            fixer_budget = max(0.0, min(self.settings.max_fix_cost_usd if self.settings is not None else 1.0,
+                                        self.total_budget - self.spent))
         else:
             fixer_budget = self.settings.max_fix_cost_usd if self.settings is not None else 1.0
         fixer = self.fixer or GeminiLLM(get_settings(max_tokens=8192, max_attempts=2, effort="low"),
                                         CostTracker(fixer_budget))
-        ctx = fixer_context("", failure)
+        ctx = fixer_context(failure)
         user = json.dumps({"task": "Diagnose the failure and propose the smallest safe fix under the hard rules.",
                            "context": ctx}, indent=1)
-        prop = fixer.structured(stage="supervisor:fix", system=SYSTEM, user=user, output_model=FixProposal, effort="low")
-        if self.fixer is None:  # real fixer: account its cost against the session cap
-            self.spent += fixer.cost.total_usd
-        return prop
+        try:
+            return fixer.structured(stage="supervisor:fix", system=SYSTEM, user=user, output_model=FixProposal, effort="low")
+        finally:
+            # account the fixer's spend even when the response was billed but unparseable (fixer_error)
+            cost = getattr(fixer, "cost", None)
+            if cost is not None:
+                self.spent += getattr(cost, "total_usd", 0.0)
+
+    def _stop(self, report: dict[str, Any], outcome: str) -> dict[str, Any]:
+        report["outcome"] = outcome
+        report["spent_usd"] = round(self.spent, 4)
+        return report
 
     def run(self, case: dict, authorize_paid: bool, max_cycles: int = 2) -> dict[str, Any]:
         report: dict[str, Any] = {"case_id": case.get("id"), "cycles": self.cycles}
+        case_dir = self.root / "outputs" / "internal" / "supervised" / str(case.get("id"))
         for cycle in range(max_cycles):
             entry: dict[str, Any] = {"cycle": cycle}
             if self.total_budget is not None:
@@ -210,9 +240,7 @@ class Supervisor:
                 if remaining <= 0.05:
                     entry["outcome"] = "total_budget_reached"
                     self.cycles.append(entry)
-                    report["outcome"] = "total_budget_reached"
-                    report["spent_usd"] = round(self.spent, 4)
-                    return report
+                    return self._stop(report, "total_budget_reached")
                 # shrink this cycle's per-case budget to what the session cap leaves (pipeline guard is per process)
                 from dataclasses import replace
 
@@ -228,35 +256,47 @@ class Supervisor:
                     cost = 0.0
                 self.spent += cost
                 entry["run_cost_usd"] = round(cost, 4)
-                # keep the full audit/ledger/report of every attempt on disk — a failed run's evidence
-                # must survive for diagnosis even when the cycle is reverted or rejected
                 try:
                     from aitx.pipeline import save_audit
 
-                    p = save_audit(res, self.root / "outputs" / "internal")
+                    p = save_audit(res, case_dir / f"cycle{cycle}")
                     entry["artifacts"] = str(p)
                 except Exception as e:
                     entry["artifact_save_error"] = f"{type(e).__name__}: {e}"
+            else:
+                # a crashed run leaves no cost object: charge the full cycle budget conservatively so
+                # the session cap can never under-count real provider spend
+                charge = self.current_settings.max_cost_usd_per_case if self.current_settings is not None else 0.0
+                self.spent += charge
+                entry["run_cost_usd"] = round(charge, 4)
+                entry["conservative_charge"] = True
             entry["spent_usd"] = round(self.spent, 4)
             blockers = getattr(res, "blockers", None) if res is not None else None
             entry["blockers"] = blockers
             if res is not None and res.submittable:
                 entry["outcome"] = "submittable"
                 self.cycles.append(entry)
-                report["outcome"] = "submittable"
-                report["spent_usd"] = round(self.spent, 4)
                 report["result"] = res
-                return report
+                return self._stop(report, "submittable")
+            if self.total_budget is not None and self.spent >= self.total_budget - 0.05:
+                # post-charge re-check: an overshoot-settled bill (thinking tokens) can push spent past
+                # the cap within a cycle; stop before any fixer/retry instead of waiting for the next cycle
+                entry["outcome"] = "session_cap_reached"
+                self.cycles.append(entry)
+                return self._stop(report, "session_cap_reached")
             if not authorize_paid:
                 entry["outcome"] = "not_authorized_to_fix"
                 self.cycles.append(entry)
-                report["outcome"] = "stopped_without_paid_fixer"
-                return report
-            if not should_fix(blockers):
+                return self._stop(report, "stopped_without_paid_fixer")
+            if not should_fix(blockers, err):
                 entry["outcome"] = "failure_is_not_a_code_error"
                 self.cycles.append(entry)
-                report["outcome"] = "not_fixable"
-                return report
+                return self._stop(report, "not_fixable")
+            if self._git.tracked_changes():
+                # never apply a fix onto the operator's own uncommitted edits: a revert could destroy them
+                entry["outcome"] = "dirty_tree_refusing_fix"
+                self.cycles.append(entry)
+                return self._stop(report, "dirty_tree_refusing_fix")
             failure = err or json.dumps(blockers)[:6000]
             try:
                 prop = self.propose_fix(failure)
@@ -264,33 +304,52 @@ class Supervisor:
                 entry["outcome"] = "fixer_error"
                 entry["fixer_error"] = f"{type(e).__name__}: {e}"
                 self.cycles.append(entry)
-                report["outcome"] = "fixer_error"
-                return report
+                return self._stop(report, "fixer_error")
             entry["diagnosis"] = prop.diagnosis[:2000]
             entry["summary"] = prop.summary[:500]
             problems = validate_proposal(prop, self.root)
+            touched = []
+            for f in prop.files:
+                # canonicalize through resolve(): on Windows this returns the on-disk case, so the
+                # write and the git revert can never disagree about the pathspec (case-sensitive git)
+                resolved = (self.root / f.path).resolve()
+                touched.append(resolved.relative_to(self.root.resolve()).as_posix())
+                if not self._git.is_tracked(touched[-1]):
+                    problems.append(f"file is not tracked by git (not revertable): {f.path!r}")
             if problems:
                 entry["outcome"] = "proposal_rejected"
                 entry["rail_violations"] = problems
                 self.cycles.append(entry)
-                report["outcome"] = "proposal_rejected"
-                return report
-            touched = [f.path for f in prop.files]
+                return self._stop(report, "proposal_rejected")
             entry["files"] = touched
-            for f in prop.files:
-                (self.root / f.path).write_text(f.content, encoding="utf-8")
+            try:
+                for f, p in zip(prop.files, touched):
+                    (self.root / p).write_text(f.content, encoding="utf-8")
+            except Exception as e:
+                self._git.revert(touched)  # tracked files only: restore whatever was already written
+                entry["outcome"] = "apply_error_reverted"
+                entry["apply_error"] = f"{type(e).__name__}: {e}"
+                self.cycles.append(entry)
+                return self._stop(report, "apply_error_reverted")
             if not self.run_suite():
                 self._git.revert(touched)
                 entry["outcome"] = "reverted_after_test_failure"
                 entry["suite_output_tail"] = getattr(self, "last_suite_output", "")[-800:]
                 self.cycles.append(entry)
-                report["outcome"] = "reverted_after_test_failure"
-                return report
-            self._git.commit(touched, prop.summary[:140])
-            entry["outcome"] = "fix_accepted_and_committed"
+                return self._stop(report, "reverted_after_test_failure")
+            try:
+                self._git.commit(touched, prop.summary[:140])
+                entry["outcome"] = "fix_accepted_and_committed"
+            except Exception as e:
+                self._git.revert(touched)
+                entry["outcome"] = "commit_failed_reverted"
+                entry["commit_error"] = f"{type(e).__name__}: {e}"
+                self.cycles.append(entry)
+                return self._stop(report, "commit_failed_reverted")
             self.cycles.append(entry)
-        report["outcome"] = "max_fix_cycles_exhausted"
-        return report
+        if self.cycles and self.cycles[-1].get("outcome") == "fix_accepted_and_committed":
+            return self._stop(report, "fix_committed_but_not_rerun")
+        return self._stop(report, "max_fix_cycles_exhausted")
 
 
 class _Git:
@@ -298,25 +357,45 @@ class _Git:
         self.root = root
         self.commands: list[list[str]] = []
 
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, text=True)
+
+    def tracked_changes(self) -> list[str]:
+        r = self._run(["status", "--porcelain", "--untracked-files=no"])
+        return [line[3:] for line in (r.stdout or "").splitlines() if line.strip()]
+
+    def is_tracked(self, path: str) -> bool:
+        r = self._run(["ls-files", "--error-unmatch", "--", path])
+        return r.returncode == 0
+
     def revert(self, paths: list[str]) -> None:
         self.commands.append(["checkout", "--", *paths])
-        subprocess.run(["git", "-C", str(self.root), "checkout", "--", *paths], check=True)
+        self._run(["checkout", "--", *paths])
 
     def commit(self, paths: list[str], summary: str) -> None:
         self.commands.append(["commit", summary])
-        subprocess.run(["git", "-C", str(self.root), "add", *paths], check=True)
-        subprocess.run(["git", "-C", str(self.root), "commit", "-m", f"supervised fix: {summary}"], check=True)
+        self._run(["add", "--", *paths])
+        r = self._run(["commit", "-m", f"supervised fix: {summary}", "--", *paths])
+        if r.returncode != 0:
+            raise RuntimeError((r.stderr or r.stdout or "commit failed")[:200])
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Supervised B_full run with Argon-driven, rail-guarded self-repair")
     ap.add_argument("--case-id", required=True)
     ap.add_argument("--authorize-paid", action="store_true", help="allow the paid fixer calls (pipeline itself is paid regardless)")
-    ap.add_argument("--max-fix-cycles", type=int, default=2)
+    ap.add_argument("--max-fix-cycles", type=int, default=1)
     ap.add_argument("--max-fix-cost-usd", type=float, default=1.0)
-    ap.add_argument("--max-total-cost-usd", type=float, default=None,
-                    help="hard session cap across pipeline runs AND fixer calls; the run stops before exceeding it")
+    ap.add_argument("--max-total-cost-usd", type=float, default=DEFAULT_SESSION_CAP_USD,
+                    help="hard session cap across pipeline runs AND fixer calls (default 12.00)")
     args = ap.parse_args(argv)
+    args.max_fix_cycles = max(1, min(2, args.max_fix_cycles))
+    if not (math.isfinite(args.max_total_cost_usd) and args.max_total_cost_usd > 0):
+        print("--max-total-cost-usd must be a positive finite number", file=sys.stderr)
+        return 2
+    if not (math.isfinite(args.max_fix_cost_usd) and args.max_fix_cost_usd > 0):
+        print("--max-fix-cost-usd must be a positive finite number", file=sys.stderr)
+        return 2
     s = get_settings(max_fix_cost_usd=args.max_fix_cost_usd)
     setup_logging(s.log_level)
     cases = [c for c in load_cases() if c["id"] == args.case_id]
@@ -324,14 +403,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"unknown case id {args.case_id}", file=sys.stderr)
         return 2
     print(f"Supervised B_full run for {args.case_id} — paid pipeline; fixer paid only with --authorize-paid "
-          f"(fixer cap ${args.max_fix_cost_usd:.2f}/cycle, {args.max_fix_cycles} cycles, "
-          f"session cap ${args.max_total_cost_usd if args.max_total_cost_usd is not None else 'unlimited'}).")
+          f"(fixer cap ${args.max_fix_cost_usd:.2f}/cycle, {args.max_fix_cycles} cycle(s), "
+          f"session cap ${args.max_total_cost_usd:.2f}; application reservation guard, not a provider-enforced cap).")
     sup = Supervisor(s, total_budget=args.max_total_cost_usd)
-    report = sup.run(cases[0], authorize_paid=args.authorize_paid, max_cycles=args.max_fix_cycles)
+    try:
+        report = sup.run(cases[0], authorize_paid=args.authorize_paid, max_cycles=args.max_fix_cycles)
+    except Exception as e:
+        report = {"case_id": args.case_id, "cycles": sup.cycles, "outcome": "unexpected_error",
+                  "unexpected_error": f"{type(e).__name__}: {e}"}
+    report.setdefault("spent_usd", round(sup.spent, 4))
     out = ROOT / "outputs" / "internal" / f"{args.case_id}.supervised.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
-    print(json.dumps({"outcome": report.get("outcome"), "cycles": len(report.get("cycles", [])), "report": str(out)}, indent=1))
+    print(json.dumps({"outcome": report.get("outcome"), "cycles": len(report.get("cycles", [])),
+                      "spent_usd": report.get("spent_usd"), "report": str(out)}, indent=1))
     return 0 if report.get("outcome") == "submittable" else 1
 
 

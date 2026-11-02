@@ -11,6 +11,7 @@ import time
 from datetime import date, datetime, timezone
 from typing import Any, TypeVar
 
+import httpx
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
@@ -62,7 +63,12 @@ class GeminiLLM:
         and the verifier re-grounds every claim against the ledger, so this cannot erase evidence."""
         if len(contents) <= 1 + 2 * keep_pairs:
             return None
-        return [contents[0]] + contents[-(2 * keep_pairs):]
+        start = len(contents) - 2 * keep_pairs
+        if start % 2 == 0:  # must begin with a model content (model contents sit at odd indices)
+            start += 1
+            if start >= len(contents):
+                return None
+        return [contents[0]] + contents[start:]
 
     def _fit(self, stage: str, contents, config):
         """Trim old rounds until the conservative context bound holds; raise (fail closed) if even the
@@ -110,15 +116,23 @@ class GeminiLLM:
             except Exception as exc:
                 code = getattr(exc, 'code', None)
                 code = code if isinstance(code, int) else None
+                name = type(exc).__name__
                 # Error bodies are deliberately never logged or propagated.
+                # A connection failure that never reached the provider is not billed; anything else
+                # that may have reached it is charged conservatively at the reserved bound.
+                never_reached = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
                 rejected = code in (400, 401, 403, 404, 429)
-                self.cost.settle(token, None if rejected else CallRecord(
-                    stage=stage, requested_model=self.model, served_model='unknown',
-                    stop_reason='provider_error', uncertain_billing=True))
-                if (code == 429 or isinstance(code, int) and code >= 500) and attempt + 1 < self.settings.max_attempts:
+                if never_reached:
+                    self.cost.settle(token, None)
+                else:
+                    self.cost.settle(token, None if rejected else CallRecord(
+                        stage=stage, requested_model=self.model, served_model='unknown',
+                        stop_reason='provider_error', uncertain_billing=True))
+                retryable = code is None or code in (408, 409, 413, 422, 429) or (isinstance(code, int) and code >= 500)
+                if retryable and attempt + 1 < self.settings.max_attempts:
                     time.sleep(min(8, 2 ** attempt))
                     continue
-                raise StructuredOutputError(f'{stage}: Gemini request failed ({type(exc).__name__}, code={code})') from None
+                raise StructuredOutputError(f'{stage}: Gemini request failed ({name}, code={code})') from None
             served = getattr(resp, 'model_version', None) or 'unknown'
             um = getattr(resp, 'usage_metadata', None)
             try:
@@ -142,9 +156,13 @@ class GeminiLLM:
                 fresh = inp - cached if not anomaly else inp
                 bill = ((fresh + tool_input) * pin + cached * cache_price + (out + thought) * pout) / 1e6
                 known = served == MODEL or served.startswith(MODEL + '-')
+                # A bill above the reserved estimate (thinking tokens are billed as output but are not
+                # capped by max_output_tokens) does NOT invalidate the turn: the true bill is recorded
+                # and the record is flagged uncertain; the valid content proceeds.
+                overshoot = bill > upper + 1e-9
                 rec = CallRecord(stage=stage, requested_model=self.model, served_model=served,
                     input_tokens=fresh + tool_input, output_tokens=out + thought, cache_read_input_tokens=cached,
-                    cost_usd=bill, seconds=round(now() - start, 2), uncertain_billing=(not known) or anomaly)
+                    cost_usd=bill, seconds=round(now() - start, 2), uncertain_billing=(not known) or anomaly or overshoot)
             except (ValueError, TypeError, AttributeError) as e:
                 # Token counts are accounting data, not provider response bodies or model text; they are
                 # included so a future shape change is diagnosable from the audit without a paid probe.
@@ -165,8 +183,6 @@ class GeminiLLM:
             self.cost.settle(token, rec)
             if not known:
                 raise StructuredOutputError(f'{stage}: unrecognized served model; no fallback allowed')
-            if bill > upper + 1e-9:
-                raise StructuredOutputError(f'{stage}: actual usage exceeded reserved estimate')
             candidates = getattr(resp, 'candidates', None) or []
             content = candidates[0].content if len(candidates) == 1 else None
             finish = candidates[0].finish_reason if len(candidates) == 1 else None
@@ -225,8 +241,13 @@ class GeminiLLM:
             contents.append(types.Content(role='user', parts=responses))
         # Separate schema-only finalization avoids mixing tools with structured
         # output constraints; the original evidence-bearing history is preserved.
-        final_contents = contents + [types.Content(role='user', parts=[types.Part(text=
-            'Return the final JSON using only retrieved evidence. Do not invent missing evidence; state gaps. Tool use is now disabled.')])]
+        final_prompt = 'Return the final JSON using only retrieved evidence. Do not invent missing evidence; state gaps. Tool use is now disabled.'
+        if contents and contents[-1].role == 'user':
+            # the tool loop exhausted its rounds with a trailing tool response; merge the final prompt
+            # into that user turn so roles keep alternating (consecutive same-role turns are invalid)
+            final_contents = contents[:-1] + [types.Content(role='user', parts=list(contents[-1].parts) + [types.Part(text=final_prompt)])]
+        else:
+            final_contents = contents + [types.Content(role='user', parts=[types.Part(text=final_prompt)])]
         final_cfg = self._config(system, effort, output_model)
         final_contents = self._fit(stage + ':final', final_contents, final_cfg)
         content = self._send(stage + ':final', final_contents, final_cfg)
