@@ -3,13 +3,26 @@
 from __future__ import annotations
 
 import re
+import time
 import xml.etree.ElementTree as ET
 from typing import Any
 
-from ..http import HttpClient, HTTPResult, ResponseValidationError
+from ..http import HttpClient, HTTPResult, ResponseValidationError, RetryableHTTPError
 from ..ledger import EvidenceLedger, EvidenceRecord
 
 BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+
+# The fullTextXML endpoint intermittently returns HTTP 500 for specific articles (upstream server error,
+# not a 404 and not rate limiting). A per-process negative cache makes repeated requests for the same
+# article fail fast for a short window; the failure is still recorded, never treated as absence.
+_FULLTEXT_UPSTREAM_FAIL: dict[str, float] = {}  # PMCID -> time.monotonic() of the last upstream 500/429
+_FULLTEXT_UPSTREAM_FAIL_TTL = 15 * 60.0
+
+
+def _upstream_error(pmcid: str) -> dict[str, str]:
+    return {"error": f"Europe PMC full-text service returned an upstream error for {pmcid} "
+                     "(HTTP 500/429; this is a retrieval failure, not evidence that the article lacks the content). "
+                     "Verify from the abstract or retry later."}
 
 
 def validate_search(r: HTTPResult) -> None:
@@ -110,10 +123,20 @@ def load_fulltext(http: HttpClient, ledger: EvidenceLedger, key: str, pmcid: str
     pmcid = pmcid.strip().upper()
     if not pmcid.startswith("PMC"):
         pmcid = "PMC" + pmcid
+    if time.monotonic() - _FULLTEXT_UPSTREAM_FAIL.get(pmcid, -1e9) < _FULLTEXT_UPSTREAM_FAIL_TTL:
+        rec.metadata["fulltext_status"] = "failed"
+        ledger.log_query("europepmc_fulltext", {"pmcid": pmcid}, [], error=f"recent upstream failure cached for {pmcid}")
+        return "failed"
     try:
         r = http.request("GET", f"{BASE}/{pmcid}/fullTextXML")
+    except RetryableHTTPError:
+        _FULLTEXT_UPSTREAM_FAIL[pmcid] = time.monotonic()
+        rec.metadata["fulltext_status"] = "failed"
+        ledger.log_query("europepmc_fulltext", {"pmcid": pmcid}, [], error=f"upstream HTTP 500/429 for {pmcid}")
+        return "failed"
     except Exception:
         rec.metadata["fulltext_status"] = "failed"
+        ledger.log_query("europepmc_fulltext", {"pmcid": pmcid}, [], error="request failed")
         return "failed"
     if r.status != 200 or "<" not in r.text[:10]:
         rec.metadata["fulltext_status"] = "not_open_access" if r.status in (404, 400) else "failed"
@@ -135,7 +158,17 @@ def europepmc_fulltext_excerpts(http: HttpClient, ledger: EvidenceLedger, pmcid:
     pmcid = pmcid.strip().upper()
     if not pmcid.startswith("PMC"):
         pmcid = "PMC" + pmcid
-    r = http.request("GET", f"{BASE}/{pmcid}/fullTextXML")
+    if time.monotonic() - _FULLTEXT_UPSTREAM_FAIL.get(pmcid, -1e9) < _FULLTEXT_UPSTREAM_FAIL_TTL:
+        ledger.log_query("europepmc_fulltext_excerpts", {"pmcid": pmcid, "keywords": keywords}, [],
+                         error=f"recent upstream failure cached for {pmcid}")
+        return _upstream_error(pmcid)
+    try:
+        r = http.request("GET", f"{BASE}/{pmcid}/fullTextXML")
+    except RetryableHTTPError:
+        _FULLTEXT_UPSTREAM_FAIL[pmcid] = time.monotonic()
+        ledger.log_query("europepmc_fulltext_excerpts", {"pmcid": pmcid, "keywords": keywords}, [],
+                         error=f"upstream HTTP 500/429 for {pmcid}")
+        return _upstream_error(pmcid)
     if r.status != 200:
         ledger.log_query("europepmc_fulltext_excerpts", {"pmcid": pmcid, "keywords": keywords}, [], error=f"HTTP {r.status}")
         return {"error": f"Full text not available (HTTP {r.status}); only open-access PMC articles are retrievable."}

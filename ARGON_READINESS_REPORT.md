@@ -49,12 +49,12 @@ Temiz ortam: Python 3.12.10, `.venv`, `pip install -r requirements.txt && pip in
 
 ```bash
 .venv/Scripts/python.exe -m pytest -q --tb=short          # çevrimdışı
-# → 260 passed, 7 deselected (live), 2 warnings (gradio/pandas, kodumuzdan değil)
+# → 294 passed, 7 deselected (live), 2 warnings (gradio/pandas, kodumuzdan değil)
 .venv/Scripts/python.exe -m pytest -m live -q --tb=short  # ücretsiz kamu API'leri
-# → 7 passed, 260 deselected
+# → 7 passed, 294 deselected
 ```
 
-- Çevrimdışı 260: birim + audit regresyonları (B1–B9, S1–S10, R1–R9), ITPR1 regresyonları, beş bilimsel bloker adversarial paketi, retrieval-failure, scientific-readiness, deployment endpoint (3), milestone, tam sentetik pipeline (Argon yanıt nesneleriyle) ve 4 yeni `test_argon_live_check` testi.
+- Çevrimdışı 294: birim + audit regresyonları (B1–B9, S1–S10, R1–R9), ITPR1 regresyonları, beş bilimsel bloker adversarial paketi, retrieval-failure (Europe PMC 500 negatif belleği dahil), scientific-readiness, deployment endpoint (3), milestone, tam sentetik pipeline (Argon yanıt nesneleriyle), guard'lar ve düzeltme regresyonları (geçmiş sıkıştırma, sıkıştırılamaz-fail-closed, rol dizilimi, Europe PMC ×2, billing şekilleri, transport yeniden denemeleri).
 - Canlı 7: PubMed/E-utilities, ClinVar, ClinicalTrials.gov, FDA etiketi, Europe PMC, VV/VEP, ITPR1 kanıt + zorunlu terapötik kapsam tamlığı (hepsi ücretsiz, kimlik bilgisi yok).
 - Astra'nın iddialarına karşı: 257 çevrimdışı iddiası → 260 doğrulandı; 18 hedefli Argon testi → `test_argon_client.py` (12 test + parametrizasyonlar) ve diğer Argon testleri paketin içinde geçti; 3 deployment endpoint testi → geçti; 7 canlı → geçti.
 
@@ -84,8 +84,59 @@ Temiz ortam: Python 3.12.10, `.venv`, `pip install -r requirements.txt && pip in
 6. Çıktıyı bilimsel olarak gözden geçir; `submittable`/`blockers`/`unresolved` alanlarını ve `audit["cost"]` kaydını incele; maliyeti Google faturasıyla karşılaştır.
 7. Tatmin ediciyse ve yalnızca ek yetki sonrası: `run_all.py --config B_full` ve `validate_submission.py`. Yarışma başvurusu bu dalda YAPILMAZ.
 
-## 7. Nihai karar
+## 7. İlk gerçek B_full koşusu ve düzeltme döngüsü (2026-11-02, geç saat)
 
-**READY FOR CONTROLLED ARGON TEST (2)**
+**Koşu:** `run_one.py --case-id AITX-40002 --config B_full`, gerçek `gemini-4-argon` (doğrulama 6/6 geçtikten sonra). Sonuç: `submittable: false`, maliyet **$4.2967**, 0 madde, kritik bloklayıcı: `StructuredOutputError: B_emerging:r17: conservative context limit exceeded` (stage_incomplete). Ek gözlem: `europepmc_fulltext_excerpts` 84 başarı / 10 hata — hepsi `500 from www.ebi.ac.uk`.
 
-Kod tamamlanmış, çevrimdışı 260 + canlı 7 test yeşil, model kimliği/fiyat/SDK uyumluluğu resmî kaynaklarla doğrulanmış, ödeme kapıları hazır ve serttir. Tek eksik, yetki gerektiren ücretli canlı doğrulamadır; bu yüzden "release candidate" (1) değil, "kontrollü teste hazır" (2) kararı verilmiştir. Bloklayıcı yoktur.
+**Kök neden 1 — bağlam tükenmesi:** Araştırmacı aracı döngüsü, her turdaki model parçasını ve her araç sonucunu sohbete sonsuza dek ekliyor; hiçbir budama yoktu. 17 turda serileştirilmiş istek, istemcinin 1.048.576 baytlık muhafazakâr uygulama sınırını aştı. Bu, modelin gerçek context penceresi DEĞİL, kodun kendi ihtiyatlı kontrolü; ama sonucu aynı: istek gönderilmeden reddedildi → pipeline fail-closed durdu (doğru davranış: eksik rapor gönderilebilir sayılmadı; ama vaka tamamlanamadı ve harcanan $4.30 ziyan oldu). Tetikleyicilerden biri: Europe PMC 500'leri modelin aynı aracı tekrar tekrar çağırmasına yol açarak hem tur sayısını hem yükü şişirdi.
+
+**Kök neden 2 — Europe PMC:** Üst akış (upstream) sunucu hatası. Canlı yeniden üretildi: başarısız 7 PMCID'nin tümü şu an da HTTP 500 döndürüyor (makale-özel, kalıcı); 429/rate-limit DEĞİL; örneklemde 10/10'dan 6'sı 200 → servis kısmen sağlıklı. Kod zaten hatayı "yok" saymıyordu (84 başarı, 10 kayıtlı başarısızlık); eksik olan: modele eyleme dönük mesaj ve aynı makalenin tekrar tekrar (4 deneme × backoff) denenmesini önleyen kısa süreli negatif bellek.
+
+**Uygulanan düzeltmeler (bu döngü):**
+- `src/aitx/llm/gemini_client.py`: sınırlı kanıt-koruyan geçmiş sıkıştırması. `_input_bound`/`_compact`/`_fit`; döngüde ve finalizasyonda istek sınıra yaklaşınca en eski turlar düşürülür (ilk kullanıcı mesajı + son 4 model/kullanıcı çifti korunur; düşünce imzaları ve çağrı ID'leri son turlarda birebir korunur). Kanıt, sohbette değil kanıt defterinde (ledger) yaşar ve doğrulayıcı her iddiayı deftere karşı yeniden temellendirir → sıkıştırma kanıt kaybedemez. Sıkıştırılamayan uç durumda eski fail-closed davranış aynen korunur. `compacted_rounds` sayacı eklendi.
+- `src/aitx/retrieval/europepmc.py`: fullTextXML için eyleme dönük hata metni ("upstream error … retrieval failure, not evidence … abstract'tan doğrula veya sonra dene") + süreç başına 15 dakikalık negatif bellek (aynı PMCID tekrarında HTTP denemesi yapılmadan hızlı başarısızlık; başarısızlık yine kayda geçer, asla "yok" sayılmaz).
+- `scripts/argon_live_check.py`: doğrulama ayarları `max_output_tokens=4096`, `thinking=low` (256 + high thinking adım 2'yi gerçekte kısaltıyordu); maliyet üst sınırı artık `GeminiLLM._send` rezervasyon matematiğiyle birebir tutarlı (7 faturalı istek).
+- Regresyon testleri: `tests/test_argon_client.py` (uzun tarihçede sıkıştırma; sıkıştırılamaz durumda fail-closed; istek başına sınır), `tests/test_retrieval_failures.py` (500 → eyleme dönük hata + negatif bellek, hem `europepmc_fulltext_excerpts` hem `load_fulltext`), `tests/test_argon_live_check.py` (yeni maliyet sınırı).
+
+**$4.2967 faturalandı mı?** Uygulama, sağlayıcının döndürdüğü gerçek `usage_metadata` token sayılarını ($2/$10 tarifesiyle) toplar; denetim kaydındaki çağrı başına gerçek input/output/cache token'ları bunu doğruluyor — yani tutar, sağlayıcının faturaladığı token hacmini yansıtır; kesin fatura Google'dadır. r17 isteği sınır kontrolünde GÖNDERİLMEDEN reddedildiği için o istek faturalanmadı; Europe PMC çağrıları ücretsiz kamu API'si. (Kullanıcının yerel denetim dosyası sonradan silindiğinden `uncertain_billing_calls` sayacı yeniden doğrulanamadı; daha önce çıkarılan kayıtlarda tüm çağrıların somut token sayaçları vardı.)
+
+**Kaldığı yerden devam (resume) var mı?** Hayır — pipeline'da checkpoint/yeniden başlatma yok. Bir koşu kesilirse baştan başlar; ancak geliştirme modunda disk önbelleği (7 gün TTL) ücretsiz alım sonuçlarını tekrarlamaz, yalnızca ücretli LLM çağrıları yenilenir. Checkpoint eklemek, doğrulama kökenini ve pipeline semantiğini değiştirecek ciddi karmaşıklık getirdiğinden bu döngüde bilinçli olarak yapılmadı (belgelendi).
+
+**Sonraki denemenin maliyet riski:** Önceki koşu, hiçbir madde doğrulanmadan 17 turda $4.30 harcadı; vaka sınırı $12 uygulama koruması aşımda güvenle keser (sağlayıcı tavanı değil). Sıkıştırma ile koşunun tamamlanması beklenir; gerçekçi aralık ~$4–12 (ITPR1 token hacmi hâlâ ölçülmedi). Koşudan önce: anahtar rotasyonu (sızan anahtar iptali), `python scripts/build_genereviews_index.py` (ilk koşuda "snapshot not built" hataları vardı) ve Google faturalama uyarıları.
+
+## 8. İkinci gerçek koşu: `missing or invalid billing metadata` (B_emerging:r1)
+
+Düzeltilmiş dal ile yapılan ikinci ücretli denemede bağlam tükenmesi **bir daha görülmedi** (sıkıştırma çalıştı; negatif bellek de gerçek koşuda kendini gösterdi: `recent upstream failure cached for PMC2707164`). Yeni ve erken bir hata çıktı: `B_emerging:r1: missing or invalid billing metadata` → yine fail-closed abort (submittable:false, 0 madde, $2.95, 35 çağrının 34'ü sorunsuz).
+
+**Teşhis:** Sorunlu çağrı, araç-ağır bir turdu (rezervasyon ~234KB payload gösteriyor). SDK dokümanı `prompt_token_count`'un cached'i İÇERDİĞİNİ söylüyor; kod `cached > prompt` durumunu geçersiz sayıyordu. Canlı servis, araç sonuçlarının baskın olduğu turlarda prompt'u cached hariç raporlamış olabilir (35 çağrıdan yalnızca bu tek çağrı düştü; aynı desendeki C_hypothesized:r1 geçti).
+
+**Düzeltme:** `gemini_client._send` artık her iki raporlama şeklini de kabul ediyor, çift sayım yapmadan faturalıyor: taze prompt + araç sonuçları input tarifesinden, cached önek cache tarifesinden; anormal şekil `uncertain_billing` olarak işaretlenip rezerve edilen üst sınırdan muhafazakâr yazılıyor (eksik faturalama yok). Gerçekten kullanılamaz metadata'da fail-closed korunuyor ve hata mesajı artık ham token sayaçlarını içeriyor (muhasebe verisi; sağlayıcı metni değil) — bir sonraki şekil değişikliği ücretli prob olmadan denetimden teşhis edilebilir.
+
+**Bu koşunun çıktıları:** `AITX-40002.md` boş rapor (tüm bölümler "No qualifying action identified… absence does not establish that none exists") — bu fail-closed tasarımın doğru sonucudur: uydurma yok, yanlış "yok" yok, gönderilemez işaretli. Yapısal QC geçti ("At least one section appears empty" uyarısı ile). Bilimsel içerik taşımaz; yalnızca abort'un eseridir.
+
+Regresyon testleri: anormal şekil kabulü + tutarlı faturalama; kullanılamaz şekilde sayaçlı hata (2 yeni test).
+
+## 9. Denetimli kendini onarma (supervised self-repair)
+
+`scripts/run_supervised.py`: koşu, kod düzeyinde bir hatayla (`stage_incomplete` + istisna imzası) düşerse, Argon'dan (API, döngü başına `AITX_MAX_FIX_COST_USD=1.00` üst sınır) teşhis + en küçük düzeltme ister; öneri şu raylara tabidir:
+
+- yalnızca mevcut `src/aitx/**` dosyaları (testler/resmî veri/promptlar/deployment dokunulmaz, yeni dosya açılamaz, yol hilesi engelli);
+- uygulanan öneri tam çevrimdışı paketten geçmek zorunda — geçemezse `git checkout` ile otomatik geri alınır;
+- kabul edilen düzeltme `supervised fix: ...` commit'i olur; reddedilen öneriler `outputs/internal/<id>.supervised.json`'da kayıtlıdır;
+- bütçe/ret (BudgetExceeded/ModelRefusal) ve gönderilebilir sonuçlar asla düzelticiyi tetiklemez; en fazla 2 düzeltme döngüsü.
+
+Her döngü konsola ve `supervised.json`'a sonuç yazar (`submittable` / `reverted_after_test_failure` / `proposal_rejected` / `not_fixable` / `fixer_error` / `max_fix_cycles_exhausted`) — takılmaz, her zaman bir sonuçla biter. **Oturum tavanı:** `--max-total-cost-usd N` ile koşular + düzeltici çağrıları birlikte sert biçimde sınırlanır (varsayılan 12.00); her döngüye yalnızca kalan bütçe kadar vaka payı verilir, aşım öncesi `total_budget_reached` ile durur ve harcanan toplam `spent_usd` olarak rapora yazılır. Bağımsız düşmanca denetimde bulunan ek raylar da eklendi: çöken koşu tam döngü bütçesiyle muhafazakâr sayılır; kirli ağaçta düzeltme uygulanmaz; yalnızca git-takip edilen, çözümü `src/aitx` içinde kalan dosyalar yazılabilir (junction kaçışı kapalı); geri alma/commit hataları kayda geçip eski haline döner; düzelticinin faturası yanıt ayrıştırılamasa bile sayılır; her döngünün audit'i ayrı klasörde saklanır. 15 çevrimdışı ray testi eklendi.
+
+**Billing kapısı değişikliği (bilinçli):** `bill > reserved estimate` durumu artık fail-closed abort yerine **işaretli-muhafazakâr** davranır — düşünce token'ları output olarak faturalanır ama `max_output_tokens` ile sınırlı DEĞİLDİR, bu yüzden geçerli bir STOP turu rezervasyon tahminini aşabilir; böyle bir tur öldürülmez, gerçek faturası kaydedilir ve `uncertain_billing` bayrağıyla denetime düşer. Eksik faturalama yok (settle `max(gerçek, rezerve)` uygular) ve bütçe hâlâ rezervasyon anında uygulanır. Transport düzeyi ayrımı da eklendi: sağlayıcıya hiç ulaşmamış bağlantı hataları faturalanmaz; 408/409/413/422/429/5xx sınırlı denemeyle yeniden denenir.
+
+## 10. Üçüncü gerçek koşu: eksik/kesik yanıt (E_followup:r9) ve denetimli onarımın ilk sahada çalışması
+
+Üçüncü ücretli denemede bağlam ve billing hataları bir daha görülmedi; koşu araştırmayı ve doğrulamayı geçti, el-aktarım takip araştırmasının 9. turunda Gemini eksik/kesik bir yanıt (`finish_reason ≠ STOP`) döndürdü ve istemci fail-closed durdu. **Süpervizörün ilk saha testi başarılıydı:** Argon doğru teşhisi koydu ("geçici eksik yanıtları sınırlı deneme bütçesi içinde yeniden dene"), önerisi çevrimdışı paketi kırdığı için raylar onu **otomatik geri aldı** (`reverted_after_test_failure`) ve ek harcama olmadan bitti.
+
+**Düzeltme (61f42ae):** eksik/kesik/engellenmiş aday turları artık sağlayıcı hataları gibi sınırlı denemeyle yeniden deneniyor (her deneme kendi muhasebesini kapatır; sohbet değişmediği için kanıt kaybı yok); bütçe bitince `candidates`/`finish_reason` içeren mesajla fail-closed. Sağlayıcı/model uyuşmazlığı, ayrıştırma hatası ve beklenmeyen araç çağrısı yine anında durur. Süpervizör artık her denemenin tam audit/ledger/raporunu diske kaydediyor ve reddedilen döngülerde test paketinin çıktı kuyruğunu rapora ekliyor.
+
+## 11. Nihai karar
+
+**READY FOR ONE CONTROLLED ARGON RETRY**
+
+Birinci koşunun iki kusuru (bağlam tükenmesi, Europe PMC tekrarı) gerçek koşuda doğrulandı ve çözüldü; ikinci koşunun yeni kusuru (billing metadata şekli) tolere edilip regresyon testleriyle sabitlendi, tam paket yeşil. Fail-closed davranış korunuyor; boş rapor asla gönderilemez sayılmıyor. Tek kontrollü AITX-40002 yeniden denemesi için hazır; `run_all.py`, yarışma başvurusu ve `main` merge'i yetkili değildir.

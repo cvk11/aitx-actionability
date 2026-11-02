@@ -11,6 +11,7 @@ import time
 from datetime import date, datetime, timezone
 from typing import Any, TypeVar
 
+import httpx
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
@@ -19,6 +20,7 @@ from .base import CallRecord, CostTracker, StructuredOutputError, now
 
 T = TypeVar('T', bound=BaseModel)
 MODEL = 'gemini-4-argon'
+CONTEXT_LIMIT = 1048576  # unified input+output token limit documented for the model; the client checks bytes conservatively
 
 
 def argon_prices(day: date | None = None) -> tuple[float, float, float]:
@@ -44,6 +46,44 @@ class GeminiLLM:
             client = genai.Client(api_key=key, http_options=types.HttpOptions(
                 timeout=900000, retry_options=types.HttpRetryOptions(attempts=1)))
         self.client = client
+        self.compacted_rounds = 0  # conversation rounds dropped by the bounded history compaction
+
+    def _input_bound(self, contents, config) -> int:
+        """Conservative serialized-request size: UTF-8 bytes of the request payload plus fixed overhead.
+        This is an application estimate (bytes overestimate tokens), not a tokenizer count."""
+        payload = json.dumps({'contents': [c.model_dump(mode='json', exclude_none=True) for c in contents],
+                              'config': config.model_dump(mode='json', exclude_none=True)}, ensure_ascii=False)
+        return len(payload.encode('utf-8')) + 4096
+
+    @staticmethod
+    def _compact(contents, keep_pairs: int):
+        """Drop the oldest conversation rounds, keeping the original user message and the most recent
+        `keep_pairs` model/user pairs (roles stay alternating). Returns None when there is nothing to drop.
+        The dropped rounds are conversation state only: retrieved evidence remains in the evidence ledger,
+        and the verifier re-grounds every claim against the ledger, so this cannot erase evidence."""
+        if len(contents) <= 1 + 2 * keep_pairs:
+            return None
+        start = len(contents) - 2 * keep_pairs
+        if start % 2 == 0:  # must begin with a model content (model contents sit at odd indices)
+            start += 1
+            if start >= len(contents):
+                return None
+        return [contents[0]] + contents[start:]
+
+    def _fit(self, stage: str, contents, config):
+        """Trim old rounds until the conservative context bound holds; raise (fail closed) if even the
+        last conversation pair does not fit. The threshold mirrors `_send` (input bound + max_tokens)."""
+        keep = 4
+        while self._input_bound(contents, config) + self.settings.max_tokens > CONTEXT_LIMIT:
+            trimmed = self._compact(contents, keep)
+            if trimmed is None:
+                keep -= 1
+                if keep < 1:
+                    raise StructuredOutputError(f'{stage}: conservative context limit exceeded')
+                continue
+            contents = trimmed
+            self.compacted_rounds += 1
+        return contents
 
     def _config(self, system, effort, output_model=None, specs=None):
         level = effort or self.settings.effort
@@ -63,10 +103,8 @@ class GeminiLLM:
     def _send(self, stage, contents, config):
         # Text-only pipeline. Byte count plus overhead intentionally overestimates
         # ordinary tokenizer input; this is an application estimate, not a quota.
-        payload = json.dumps({'contents': [c.model_dump(mode='json', exclude_none=True) for c in contents],
-                              'config': config.model_dump(mode='json', exclude_none=True)}, ensure_ascii=False)
-        input_bound = len(payload.encode('utf-8')) + 4096
-        if input_bound + self.settings.max_tokens > 1048576:
+        input_bound = self._input_bound(contents, config)
+        if input_bound + self.settings.max_tokens > CONTEXT_LIMIT:
             raise StructuredOutputError(f'{stage}: conservative context limit exceeded')
         for attempt in range(self.settings.max_attempts):
             pin, pout, cache_price = argon_prices()
@@ -78,43 +116,88 @@ class GeminiLLM:
             except Exception as exc:
                 code = getattr(exc, 'code', None)
                 code = code if isinstance(code, int) else None
+                name = type(exc).__name__
                 # Error bodies are deliberately never logged or propagated.
+                # A connection failure that never reached the provider is not billed; anything else
+                # that may have reached it is charged conservatively at the reserved bound.
+                never_reached = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
                 rejected = code in (400, 401, 403, 404, 429)
-                self.cost.settle(token, None if rejected else CallRecord(
-                    stage=stage, requested_model=self.model, served_model='unknown',
-                    stop_reason='provider_error', uncertain_billing=True))
-                if (code == 429 or isinstance(code, int) and code >= 500) and attempt + 1 < self.settings.max_attempts:
+                if never_reached:
+                    self.cost.settle(token, None)
+                else:
+                    self.cost.settle(token, None if rejected else CallRecord(
+                        stage=stage, requested_model=self.model, served_model='unknown',
+                        stop_reason='provider_error', uncertain_billing=True))
+                retryable = code is None or code in (408, 409, 413, 422, 429) or (isinstance(code, int) and code >= 500)
+                if retryable and attempt + 1 < self.settings.max_attempts:
                     time.sleep(min(8, 2 ** attempt))
                     continue
-                raise StructuredOutputError(f'{stage}: Gemini request failed ({type(exc).__name__}, code={code})') from None
+                raise StructuredOutputError(f'{stage}: Gemini request failed ({name}, code={code})') from None
             served = getattr(resp, 'model_version', None) or 'unknown'
             um = getattr(resp, 'usage_metadata', None)
             try:
-                if um is None or um.prompt_token_count is None or um.candidates_token_count is None:
-                    raise ValueError('missing usage')
-                inp, out = int(um.prompt_token_count), int(um.candidates_token_count)
+                if um is None:
+                    raise ValueError('usage metadata absent')
+                inp, out = um.prompt_token_count, um.candidates_token_count
+                if inp is None or out is None:
+                    raise ValueError('prompt/candidates token counts absent')
+                inp, out = int(inp), int(out)
                 thought, cached = int(um.thoughts_token_count or 0), int(um.cached_content_token_count or 0)
                 tool_input = int(um.tool_use_prompt_token_count or 0)
-                if min(inp, out, thought, cached, tool_input) < 0 or cached > inp:
-                    raise ValueError('invalid usage')
-                bill = ((inp - cached + tool_input) * pin + cached * cache_price + (out + thought) * pout) / 1e6
+                if min(inp, out, thought, cached, tool_input) < 0:
+                    raise ValueError('negative token count')
+                # Google documents prompt_token_count as INCLUDING cached tokens, but the live
+                # service has been observed reporting cached_content_token_count above
+                # prompt_token_count on tool-heavy turns (prompt then excludes the cached prefix).
+                # Accept both shapes without double counting: fresh prompt tokens and tool-result
+                # tokens at the input rate, the cached prefix at the cache rate. An anomalous shape
+                # is flagged as uncertain billing (settled at the conservative reserved bound).
+                anomaly = cached > inp
+                fresh = inp - cached if not anomaly else inp
+                bill = ((fresh + tool_input) * pin + cached * cache_price + (out + thought) * pout) / 1e6
                 known = served == MODEL or served.startswith(MODEL + '-')
+                # A bill above the reserved estimate (thinking tokens are billed as output but are not
+                # capped by max_output_tokens) does NOT invalidate the turn: the true bill is recorded
+                # and the record is flagged uncertain; the valid content proceeds.
+                overshoot = bill > upper + 1e-9
                 rec = CallRecord(stage=stage, requested_model=self.model, served_model=served,
-                    input_tokens=inp-cached+tool_input, output_tokens=out+thought, cache_read_input_tokens=cached,
-                    cost_usd=bill, seconds=round(now()-start, 2), uncertain_billing=not known)
-            except (ValueError, TypeError, AttributeError):
+                    input_tokens=fresh + tool_input, output_tokens=out + thought, cache_read_input_tokens=cached,
+                    cost_usd=bill, seconds=round(now() - start, 2), uncertain_billing=(not known) or anomaly or overshoot)
+            except (ValueError, TypeError, AttributeError) as e:
+                # Token counts are accounting data, not provider response bodies or model text; they are
+                # included so a future shape change is diagnosable from the audit without a paid probe.
+                detail = (f'{e}; prompt={getattr(um, "prompt_token_count", None)} '
+                          f'candidates={getattr(um, "candidates_token_count", None)} '
+                          f'cached={getattr(um, "cached_content_token_count", None)} '
+                          f'thoughts={getattr(um, "thoughts_token_count", None)} '
+                          f'tool_use={getattr(um, "tool_use_prompt_token_count", None)}')
                 self.cost.settle(token, CallRecord(stage=stage, requested_model=self.model, served_model=served,
-                    stop_reason='invalid_usage', uncertain_billing=True))
-                raise StructuredOutputError(f'{stage}: missing or invalid billing metadata') from None
+                    stop_reason='invalid_usage', uncertain_billing=True, detail=detail))
+                if attempt + 1 < self.settings.max_attempts:
+                    # A response whose billing cannot be verified is unusable (fail-closed), but a single
+                    # transient metadata omission must not kill the stage: retry like a provider error.
+                    time.sleep(min(8, 2 ** attempt))
+                    continue
+                raise StructuredOutputError(
+                    f'{stage}: missing or invalid billing metadata after retries ({detail})') from None
             self.cost.settle(token, rec)
             if not known:
                 raise StructuredOutputError(f'{stage}: unrecognized served model; no fallback allowed')
-            if bill > upper + 1e-9:
-                raise StructuredOutputError(f'{stage}: actual usage exceeded reserved estimate')
             candidates = getattr(resp, 'candidates', None) or []
-            if len(candidates) != 1 or candidates[0].finish_reason != types.FinishReason.STOP or not candidates[0].content:
-                raise StructuredOutputError(f'{stage}: missing, blocked, truncated or incomplete Gemini response')
-            return candidates[0].content
+            content = candidates[0].content if len(candidates) == 1 else None
+            finish = candidates[0].finish_reason if len(candidates) == 1 else None
+            if len(candidates) != 1 or finish != types.FinishReason.STOP or not content:
+                # A transiently empty, blocked or truncated turn (e.g. MAX_TOKENS mid-tool-loop, as seen at
+                # E_followup:r9 in the third real paid run) is retried like a provider error: the sent
+                # conversation is unchanged, so nothing is lost, and this attempt's billing is already
+                # settled. Fail closed only after the bounded attempt budget.
+                if attempt + 1 < self.settings.max_attempts:
+                    time.sleep(min(8, 2 ** attempt))
+                    continue
+                raise StructuredOutputError(
+                    f'{stage}: missing, blocked, truncated or incomplete Gemini response '
+                    f'(candidates={len(candidates)}, finish_reason={finish})') from None
+            return content
         raise StructuredOutputError(f'{stage}: retry budget exhausted')
 
     @staticmethod
@@ -138,7 +221,11 @@ class GeminiLLM:
         allowed = {s['name'] for s in specs}
         contents = [types.Content(role='user', parts=[types.Part(text=user)])]
         for n in range(max_rounds):
-            content = self._send(f'{stage}:r{n}', contents, self._config(system, effort, specs=specs))
+            cfg = self._config(system, effort, specs=specs)
+            # Long tool loops can grow the serialized history past the conservative context
+            # bound; trim the oldest rounds (evidence stays in the ledger) before sending.
+            contents = self._fit(f'{stage}:r{n}', contents, cfg)
+            content = self._send(f'{stage}:r{n}', contents, cfg)
             # Preserve every part, including opaque thought signatures and call IDs.
             contents.append(content)
             calls = [p.function_call for p in (content.parts or []) if p.function_call]
@@ -154,9 +241,16 @@ class GeminiLLM:
             contents.append(types.Content(role='user', parts=responses))
         # Separate schema-only finalization avoids mixing tools with structured
         # output constraints; the original evidence-bearing history is preserved.
-        contents.append(types.Content(role='user', parts=[types.Part(text=
-            'Return the final JSON using only retrieved evidence. Do not invent missing evidence; state gaps. Tool use is now disabled.')]))
-        content = self._send(stage+':final', contents, self._config(system, effort, output_model))
+        final_prompt = 'Return the final JSON using only retrieved evidence. Do not invent missing evidence; state gaps. Tool use is now disabled.'
+        if contents and contents[-1].role == 'user':
+            # the tool loop exhausted its rounds with a trailing tool response; merge the final prompt
+            # into that user turn so roles keep alternating (consecutive same-role turns are invalid)
+            final_contents = contents[:-1] + [types.Content(role='user', parts=list(contents[-1].parts) + [types.Part(text=final_prompt)])]
+        else:
+            final_contents = contents + [types.Content(role='user', parts=[types.Part(text=final_prompt)])]
+        final_cfg = self._config(system, effort, output_model)
+        final_contents = self._fit(stage + ':final', final_contents, final_cfg)
+        content = self._send(stage + ':final', final_contents, final_cfg)
         if any(p.function_call for p in (content.parts or [])):
             raise StructuredOutputError(f'{stage}: tool call after tool budget exhausted')
         return self._parse(stage, content, output_model)

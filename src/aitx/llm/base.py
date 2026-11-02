@@ -43,6 +43,7 @@ class CallRecord:
     request_id: str = ""
     fallback_used: bool = False
     uncertain_billing: bool = False  # request failed after being sent; cost charged conservatively at its reserved upper bound
+    detail: str = ""  # diagnosable accounting detail (token counts etc.), never provider response bodies
 
 
 def max_prices() -> dict[str, float]:
