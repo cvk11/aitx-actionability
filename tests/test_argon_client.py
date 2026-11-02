@@ -1,0 +1,163 @@
+"""Real SDK-shaped offline responses; no model API calls or credentials."""
+import json
+from datetime import date
+from types import SimpleNamespace as NS
+from dataclasses import replace
+
+import pytest
+from google.genai import types
+from pydantic import BaseModel
+
+from aitx.llm.gemini_client import GeminiLLM, argon_prices
+from aitx.llm.base import CostTracker, StructuredOutputError, BudgetExceeded
+
+
+class Answer(BaseModel):
+    result: str
+
+
+def response(text='{"result":"ok"}', parts=None, **kw):
+    return types.GenerateContentResponse(model_version=kw.pop('model', 'gemini-4-argon'),
+        candidates=[types.Candidate(content=types.Content(role='model', parts=parts or [types.Part(text=text)]),
+                                    finish_reason=kw.pop('finish', 'STOP'))],
+        usage_metadata=kw.pop('usage', types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=1000, candidates_token_count=100, thoughts_token_count=200, cached_content_token_count=400)), **kw)
+
+
+class Client:
+    def __init__(self, script):
+        self.script=list(script);self.calls=[];self.models=self
+    def generate_content(self, **kw):
+        self.calls.append(kw)
+        result=self.script.pop(0)
+        if isinstance(result, Exception): raise result
+        return result
+
+
+def invoke(settings, script):
+    client=Client(script);cost=CostTracker(12)
+    llm=GeminiLLM(settings,cost,client=client)
+    return llm,client,cost
+
+
+def test_structured_billing_and_no_hidden_calls(settings):
+    llm,client,cost=invoke(settings,[response()])
+    assert llm.structured(stage='x',system='s',user='u',output_model=Answer).result=='ok'
+    cfg=client.calls[0]['config']
+    assert cfg.store is False and cfg.automatic_continuation is False
+    assert cfg.automatic_function_calling.disable
+    assert cfg.temperature is None and cfg.cached_content is None
+    pin,pout,cache=argon_prices()
+    assert cost.calls[0].output_tokens==300
+    assert cost.total_usd==round((600*pin+400*cache+300*pout)/1e6,4)
+    assert cost.reserved_usd==0
+
+
+@pytest.mark.parametrize('bad', [response(finish='MAX_TOKENS'),response(finish='CONTINUATION'),
+    response(finish='SAFETY'),response(model='gemini-3.8-flash'),response(usage=None),response(text='PATIENT_SECRET'),
+    None, response(parts=[types.Part(text='{"result":"ok"}'),types.Part(function_call=types.FunctionCall(name='unrequested',args={}))])])
+def test_incomplete_or_wrong_provider_output_fails_closed(settings,bad):
+    llm,client,cost=invoke(settings,[bad])
+    with pytest.raises(StructuredOutputError) as e:
+        llm.structured(stage='x',system='s',user='u',output_model=Answer)
+    assert 'PATIENT_SECRET' not in str(e.value)
+    assert len(client.calls)==1 and cost.reserved_usd==0
+
+
+def test_budget_blocks_before_request(settings):
+    llm,client,cost=invoke(settings,[]);cost.budget_usd=0.01
+    with pytest.raises(BudgetExceeded): llm.structured(stage='x',system='s',user='u',output_model=Answer)
+    assert not client.calls
+
+
+class ProviderError(Exception):
+    def __init__(self,code): self.code=code;super().__init__('SECRET provider response')
+
+
+@pytest.mark.parametrize('code,n_calls',[(429,3),(503,3),(401,1),(403,1)])
+def test_bounded_retries_and_sanitized_errors(settings,monkeypatch,code,n_calls):
+    monkeypatch.setattr('aitx.llm.gemini_client.time.sleep',lambda _:None)
+    llm,client,cost=invoke(settings,[ProviderError(code)]*3)
+    with pytest.raises(StructuredOutputError) as e:
+        llm.structured(stage='x',system='s',user='u',output_model=Answer)
+    assert len(client.calls)==n_calls and 'SECRET' not in str(e.value)
+    assert cost.reserved_usd==0
+    assert bool(cost.calls)==(code==503)
+
+
+def test_parallel_tool_calls_keep_signatures_ids_and_results(settings):
+    parts=[types.Part(function_call=types.FunctionCall(id='a',name='lookup',args={'q':'A'}),thought_signature=b'opaque'),
+           types.Part(function_call=types.FunctionCall(id='b',name='lookup',args={'q':'B'}))]
+    llm,client,cost=invoke(settings,[response(parts=parts),response()])
+    seen=[]
+    tb=NS(specs=lambda names,strict: [{'name':'lookup','description':'Lookup','input_schema':{'type':'object','properties':{'q':{'type':'string'}}}}],
+          execute=lambda name,args:(seen.append(args) or json.dumps(args),False))
+    out=llm.agent(stage='x',system='s',user='u',output_model=Answer,toolbox=tb,tool_names=None,max_rounds=1)
+    assert out.result=='ok' and len(seen)==2
+    history=client.calls[-1]['contents']
+    assert history[1].parts[0].thought_signature==b'opaque'
+    assert [p.function_response.id for p in history[2].parts]==['a','b']
+    assert client.calls[-1]['config'].tools is None
+
+
+def test_price_schedule_expiry():
+    assert argon_prices(date(2026,11,30))==(2,10,0.1)
+    assert argon_prices(date(2026,12,1))==(4,20,0.2)
+
+
+def test_real_sdk_request_serialization_without_network(settings):
+    import httpx
+    from google import genai
+    seen=[]
+    def handler(req):
+        seen.append(json.loads(req.content))
+        return httpx.Response(200,json=response().model_dump(mode='json',by_alias=True,exclude_none=True))
+    client=genai.Client(api_key='offline-placeholder',http_options=types.HttpOptions(
+        client_args={'transport':httpx.MockTransport(handler)},retry_options=types.HttpRetryOptions(attempts=1)))
+    try:
+        llm=GeminiLLM(settings,CostTracker(12),client=client)
+        assert llm.structured(stage='x',system='s',user='u',output_model=Answer).result=='ok'
+        assert seen[0]['store'] is False
+        assert seen[0]['generationConfig']['responseJsonSchema']['type']=='object'
+    finally: client.close()
+
+
+def test_full_pipeline_through_argon_responses(settings,fake_http,test_case):
+    from mock_handlers import HANDLERS, hypothesized, established, verify
+    from aitx.pipeline import Pipeline
+    from aitx.schemas import RevisionPlan, Section
+    from aitx.submission import assemble_submission, SubmissionBlocked
+    from aitx.qc import check_report_structure
+    class ScriptedGemini(GeminiLLM):
+        is_mock=True
+        def agent(self, **kw):
+            self.tb=kw['toolbox']
+            return super().agent(**kw)
+        def _send(self, stage, contents, config):
+            # The transport is replaced; the production request handling,
+            # accounting, JSON parsing, and finalization are still exercised.
+            if config.tools:
+                self.client.script.append(response(text='Research complete; finalize.'))
+            else:
+                prefix=next(p for p in sorted(HANDLERS,key=len,reverse=True) if stage.startswith(p))
+                ctx={'system':config.system_instruction,'toolbox':getattr(self,'tb',None)}
+                out=HANDLERS[prefix](ctx)
+                if prefix=='C_hypothesized': out.items[0].bespoke_verdict='AMENABLE'
+                if prefix=='B_established':
+                    out.items[-1].section=Section.OFF_LABEL
+                    out.items[-1].human_precedent='Drug Q cured this patient.'
+                if prefix=='D_verify':
+                    for d in out.verdicts:
+                        if d.item_id in ('aso-allele','tgt-q') and d.claim_index==-1: d.verdict='unsupported'
+                if prefix=='F_revise': out=RevisionPlan(revisions=[])
+                self.client.script.append(response(text=out.model_dump_json()))
+            return super()._send(stage,contents,config)
+    llm=ScriptedGemini(settings,CostTracker(12),client=Client([]))
+    r=Pipeline(llm,settings,http=fake_http,parallel=False,cost=llm.cost).run(test_case)
+    assert r.audit['stages_completed']
+    assert check_report_structure(r.output.report_markdown,test_case['id']).ok
+    assert 'Drug Q cured this patient' not in r.output.report_markdown
+    assert not any(i['bespoke_verdict']=='AMENABLE' for i in r.audit['final_items'])
+    assert 'Compound R' in r.output.report_markdown
+    assert assemble_submission([r],[test_case['id']],allow_mock=True)
+    with pytest.raises(SubmissionBlocked): assemble_submission([r],[test_case['id']])
